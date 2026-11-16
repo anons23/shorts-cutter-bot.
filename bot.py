@@ -9,7 +9,9 @@ import tempfile
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.client.telegram import TelegramAPIServer
+from pathlib import Path
+
+from aiogram.client.telegram import SimpleFilesPathWrapper, TelegramAPIServer
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (CallbackQuery, FSInputFile, InlineKeyboardButton,
@@ -25,6 +27,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 BOT_API_URL = os.getenv("BOT_API_URL", "")  # свой Local Bot API Server (для файлов до 2 ГБ)
+# Если Bot API сервер в Docker: папка файлов внутри контейнера и та же папка на компьютере
+BOT_API_SERVER_DIR = os.getenv("BOT_API_SERVER_DIR", "")
+BOT_API_LOCAL_DIR = os.getenv("BOT_API_LOCAL_DIR", "")
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "3"))  # 0 — без лимита
 MAX_VIDEO_MIN = int(os.getenv("MAX_VIDEO_MIN", "90"))
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
@@ -213,8 +218,13 @@ async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Не задан BOT_TOKEN в файле .env")
     shutil.which(config.FFMPEG) or logging.warning("FFmpeg не найден! Установи его (см. README).")
-    session = (AiohttpSession(api=TelegramAPIServer.from_base(BOT_API_URL, is_local=True))
-               if BOT_API_URL else None)
+    session = None
+    if BOT_API_URL:
+        extra = {}
+        if BOT_API_SERVER_DIR and BOT_API_LOCAL_DIR:
+            extra["wrap_local_file"] = SimpleFilesPathWrapper(Path(BOT_API_SERVER_DIR),
+                                                              Path(BOT_API_LOCAL_DIR))
+        session = AiohttpSession(api=TelegramAPIServer.from_base(BOT_API_URL, is_local=True, **extra))
     bot = Bot(BOT_TOKEN, session=session)
     asyncio.create_task(worker())
     await dp.start_polling(bot)
