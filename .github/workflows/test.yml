@@ -1,0 +1,34 @@
+name: Тесты
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Установка FFmpeg и библиотек
+        run: |
+          sudo apt-get update && sudo apt-get install -y ffmpeg
+          pip install -r requirements.txt
+      - name: Тесты ядра
+        run: python -m unittest discover tests -v
+      - name: Бот импортируется без ошибок
+        run: BOT_TOKEN= python -c "import bot"
+      - name: Пробный монтаж на тестовом видео
+        run: |
+          ffmpeg -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 \
+            -t 120 -c:v libx264 -preset ultrafast -c:a aac -shortest /tmp/src.mp4
+          python clip.py /tmp/src.mp4 --fake --no-llm --clips 2 --unique strong --out /tmp/out
+          ls -la /tmp/out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-shorts
+          path: /tmp/out/*.mp4
+          retention-days: 3

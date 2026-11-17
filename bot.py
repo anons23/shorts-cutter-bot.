@@ -1,16 +1,16 @@
 """Telegram-бот поверх ядра shorts/. Запуск: python bot.py"""
 import asyncio
 import datetime as dt
+import json
 import logging
 import os
 import re
 import shutil
 import tempfile
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
-from pathlib import Path
-
 from aiogram.client.telegram import SimpleFilesPathWrapper, TelegramAPIServer
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
@@ -36,9 +36,35 @@ ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split("
 
 YT_RE = re.compile(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/\S+")
 
+STATE_FILE = Path(os.getenv("STATE_FILE", "state.json"))  # настройки и лимиты переживают перезапуск
+MAX_QUEUE_PER_USER = 2  # сколько видео один человек может держать в очереди
+
 user_settings: dict[int, dict] = {}  # {user_id: {"unique": ..., "layout": ..., "clips": ...}}
 usage: dict[int, tuple[dt.date, int]] = {}  # {user_id: (дата, сколько видео сегодня)}
+pending: dict[int, int] = {}  # {user_id: сколько видео ждёт в очереди}
 queue: asyncio.Queue = asyncio.Queue()
+
+
+def load_state() -> None:
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    for uid, s in data.get("settings", {}).items():
+        user_settings[int(uid)] = s
+    for uid, (day, count) in data.get("usage", {}).items():
+        usage[int(uid)] = (dt.date.fromisoformat(day), count)
+
+
+def save_state() -> None:
+    data = {"settings": user_settings,
+            "usage": {uid: [day.isoformat(), count] for uid, (day, count) in usage.items()}}
+    try:
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(STATE_FILE)
+    except OSError:
+        logging.exception("Не удалось сохранить state.json")
 
 
 def settings_for(uid: int) -> dict:
@@ -46,18 +72,21 @@ def settings_for(uid: int) -> dict:
                                           "clips": config.DEFAULT_CLIPS})
 
 
+def used_today(uid: int) -> int:
+    day, count = usage.get(uid, (dt.date.today(), 0))
+    return count if day == dt.date.today() else 0
+
+
 def check_limit(uid: int) -> bool:
     if DAILY_LIMIT <= 0 or uid in ADMIN_IDS:
         return True
-    day, count = usage.get(uid, (dt.date.today(), 0))
-    if day != dt.date.today():
-        count = 0
-    return count < DAILY_LIMIT
+    # считаем и уже обработанные, и те, что ещё стоят в очереди
+    return used_today(uid) + pending.get(uid, 0) < DAILY_LIMIT
 
 
 def add_usage(uid: int) -> None:
-    day, count = usage.get(uid, (dt.date.today(), 0))
-    usage[uid] = (dt.date.today(), (count if day == dt.date.today() else 0) + 1)
+    usage[uid] = (dt.date.today(), used_today(uid) + 1)
+    save_state()
 
 
 def settings_keyboard(s: dict) -> InlineKeyboardMarkup:
@@ -81,8 +110,18 @@ async def start(m: Message) -> None:
     await m.answer(
         "👋 Привет! Пришли мне длинное видео (файлом) или ссылку на YouTube — "
         "я найду интересные моменты и сделаю вертикальные шортсы с субтитрами.\n\n"
-        f"⚙️ /settings — уникализация, формат и количество шортсов.{limit}\n\n"
+        f"⚙️ /settings — уникализация, формат и количество шортсов.\n"
+        f"📊 /limit — сколько видео осталось на сегодня.{limit}\n\n"
         "Загружай только видео, на которые у тебя есть права.")
+
+
+@dp.message(Command("limit"))
+async def limit_cmd(m: Message) -> None:
+    uid = m.from_user.id
+    if DAILY_LIMIT <= 0 or uid in ADMIN_IDS:
+        await m.answer("У тебя нет лимита ♾")
+    else:
+        await m.answer(f"Сегодня использовано {used_today(uid)} из {DAILY_LIMIT} видео.")
 
 
 @dp.message(Command("settings"))
@@ -92,9 +131,14 @@ async def settings_cmd(m: Message) -> None:
 
 @dp.callback_query(F.data.startswith("set:"))
 async def settings_cb(c: CallbackQuery) -> None:
-    _, key, value = c.data.split(":")
+    _, key, value = c.data.split(":", 2)
     s = settings_for(c.from_user.id)
+    allowed = {"unique": ("none", "light", "strong"), "layout": ("blur", "crop"), "clips": ("3", "5", "8")}
+    if value not in allowed.get(key, ()):
+        await c.answer()
+        return
     s[key] = int(value) if key == "clips" else value
+    save_state()
     try:
         await c.message.edit_reply_markup(reply_markup=settings_keyboard(s))
     except TelegramBadRequest:
@@ -106,6 +150,11 @@ async def enqueue(m: Message, kind: str, payload: str) -> None:
     if not check_limit(m.from_user.id):
         await m.answer(f"⏳ Лимит {DAILY_LIMIT} видео в день исчерпан. Возвращайся завтра!")
         return
+    uid = m.from_user.id
+    if pending.get(uid, 0) >= MAX_QUEUE_PER_USER and uid not in ADMIN_IDS:
+        await m.answer("⏳ Дождись, пока обработаются предыдущие видео.")
+        return
+    pending[uid] = pending.get(uid, 0) + 1
     await queue.put((m, kind, payload))
     pos = queue.qsize()
     await m.answer("✅ Принял! " + (f"Ты в очереди: {pos}-й." if pos > 1 else "Начинаю обработку..."))
@@ -183,7 +232,9 @@ async def process(m: Message, kind: str, payload: str) -> None:
         await _safe_edit(status, f"📤 Готово! Отправляю {len(results)} шортс(ов)...")
         for r in results:
             caption = f"🎬 {r['title']}\n⏱ {_mmss(r['start'])}–{_mmss(r['end'])}"
-            await m.answer_video(FSInputFile(r["path"]), caption=caption, supports_streaming=True)
+            await m.answer_video(FSInputFile(r["path"]), caption=caption, supports_streaming=True,
+                                 width=r["width"], height=r["height"],
+                                 duration=round(r["end"] - r["start"]))
         add_usage(m.from_user.id)
         await _safe_edit(status, "✅ Готово! Присылай следующее видео.")
     except Exception as e:  # noqa: BLE001
@@ -210,14 +261,20 @@ async def worker() -> None:
         m, kind, payload = await queue.get()
         try:
             await process(m, kind, payload)
+        except Exception:  # noqa: BLE001 — очередь не должна останавливаться из-за одной ошибки
+            logging.exception("Сбой в обработчике очереди")
         finally:
+            uid = m.from_user.id
+            pending[uid] = max(0, pending.get(uid, 0) - 1)
             queue.task_done()
 
 
 async def main() -> None:
     if not BOT_TOKEN:
         raise SystemExit("Не задан BOT_TOKEN в файле .env")
-    shutil.which(config.FFMPEG) or logging.warning("FFmpeg не найден! Установи его (см. README).")
+    if not shutil.which(config.FFMPEG):
+        raise SystemExit("FFmpeg не найден. Установи его (см. README) и запусти python check.py")
+    load_state()
     session = None
     if BOT_API_URL:
         extra = {}

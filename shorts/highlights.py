@@ -2,6 +2,7 @@
 import json
 import math
 import re
+import time
 
 import requests
 
@@ -54,15 +55,31 @@ def _ask_llm(transcript: str, n: int) -> list[dict]:
         "temperature": 0.4,
         "response_format": {"type": "json_object"},
     }
-    r = requests.post(f"{config.LLM_BASE_URL.rstrip('/')}/chat/completions",
-                      headers={"Authorization": f"Bearer {config.LLM_API_KEY}"},
-                      json=body, timeout=180)
-    if r.status_code != 200:
+    url = f"{config.LLM_BASE_URL.rstrip('/')}/chat/completions"
+    headers = {"Authorization": f"Bearer {config.LLM_API_KEY}"}
+    r = None
+    for _ in range(4):
+        r = requests.post(url, headers=headers, json=body, timeout=180)
+        if r.status_code == 429:  # лимит запросов — ждём и пробуем снова
+            time.sleep(min(float(r.headers.get("retry-after", 15)), 90))
+            continue
+        if r.status_code >= 500:
+            time.sleep(5)
+            continue
+        if r.status_code == 400 and "response_format" in body:
+            body.pop("response_format")  # не все модели умеют JSON-режим
+            continue
+        break
+    if r is None or r.status_code != 200:
         raise RuntimeError(f"Нейросеть вернула ошибку {r.status_code}: {r.text[:500]}")
-    text = r.json()["choices"][0]["message"]["content"]
+    text = r.json()["choices"][0]["message"]["content"] or ""
     match = re.search(r"\{.*\}", text, re.S)
-    data = json.loads(match.group(0) if match else text)
-    return data.get("clips", [])
+    try:
+        data = json.loads(match.group(0) if match else text)
+    except json.JSONDecodeError:
+        return []
+    clips = data.get("clips", []) if isinstance(data, dict) else []
+    return [c for c in clips if isinstance(c, dict)]
 
 
 def _snap(clip: dict, segments: list[dict], duration: float) -> dict | None:

@@ -8,3 +8,5 @@ output/
 *.mov
 *.mkv
 *.mp3
+state.json
+state.tmp

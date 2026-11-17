@@ -25,6 +25,15 @@ def extract_audio(video: str, work_dir: str) -> list[str]:
     return sorted(glob.glob(os.path.join(work_dir, "audio_*.mp3")))
 
 
+def _duration(path: str) -> float:
+    out = subprocess.run([config.FFPROBE, "-v", "error", "-show_entries", "format=duration",
+                          "-of", "csv=p=0", path], capture_output=True, text=True).stdout.strip()
+    try:
+        return float(out)
+    except ValueError:
+        return float(CHUNK_SEC)
+
+
 def _transcribe_chunk(path: str) -> dict:
     if not config.GROQ_API_KEY:
         raise RuntimeError("Не задан GROQ_API_KEY в файле .env")
@@ -44,6 +53,9 @@ def _transcribe_chunk(path: str) -> dict:
             wait = float(r.headers.get("retry-after", 20))
             time.sleep(min(wait, 120))
             continue
+        if r.status_code >= 500:  # временный сбой на стороне Groq
+            time.sleep(5)
+            continue
         if r.status_code != 200:
             raise RuntimeError(f"Groq вернул ошибку {r.status_code}: {r.text[:500]}")
         return r.json()
@@ -53,8 +65,8 @@ def _transcribe_chunk(path: str) -> dict:
 def transcribe(video: str, work_dir: str) -> dict:
     """Возвращает {"segments": [{start, end, text}], "words": [{word, start, end}]}."""
     segments, words = [], []
-    for i, chunk in enumerate(extract_audio(video, work_dir)):
-        offset = i * CHUNK_SEC
+    offset = 0.0  # куски получаются не ровно по 20 минут — считаем по реальной длине
+    for chunk in extract_audio(video, work_dir):
         res = _transcribe_chunk(chunk)
         for s in res.get("segments", []):
             segments.append({"start": s["start"] + offset, "end": s["end"] + offset,
@@ -62,6 +74,7 @@ def transcribe(video: str, work_dir: str) -> dict:
         for w in res.get("words", []):
             words.append({"word": w["word"].strip(), "start": w["start"] + offset,
                           "end": w["end"] + offset})
+        offset += _duration(chunk)
     return {"segments": segments, "words": words}
 
 

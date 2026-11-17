@@ -39,7 +39,11 @@ def make_shorts(video: str, out_dir: str, n_clips: int = config.DEFAULT_CLIPS,
             raise ValueError("В видео не найдено речи")
 
         progress("🧠 Ищу интересные моменты...")
-        clips = find_highlights(transcript, n_clips, info["duration"], use_llm=use_llm)
+        try:
+            clips = find_highlights(transcript, n_clips, info["duration"], use_llm=use_llm)
+        except Exception as e:  # noqa: BLE001 — нейросеть недоступна, но шортсы всё равно сделаем
+            progress(f"⚠️ Нейросеть недоступна ({str(e)[:200]}). Выбираю моменты по простому правилу...")
+            clips = find_highlights(transcript, n_clips, info["duration"], use_llm=False)
         if not clips:
             raise ValueError("Не нашёл подходящих моментов — видео слишком короткое?")
 
@@ -49,5 +53,6 @@ def make_shorts(video: str, out_dir: str, n_clips: int = config.DEFAULT_CLIPS,
             out = os.path.join(out_dir, f"{i:02d}_{_safe_name(c['title'])}.mp4")
             render_clip(video, info, transcript["words"], c["start"], c["end"], out, work,
                         unique=unique, layout=layout, resolution=resolution)
-            results.append({"path": out, **c})
+            w = resolution - resolution % 2
+            results.append({"path": out, "width": w, "height": round(w * 16 / 9 / 2) * 2, **c})
     return results
