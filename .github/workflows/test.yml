@@ -26,9 +26,11 @@ jobs:
           ffmpeg -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 \
             -t 120 -c:v libx264 -preset ultrafast -c:a aac -shortest /tmp/src.mp4
           python clip.py /tmp/src.mp4 --fake --no-llm --clips 2 --unique strong --out /tmp/out
+          python clip.py /tmp/src.mp4 --fake --times "0:10-0:25, 1:00-1:15" --out /tmp/out/manual
+          python clip.py /tmp/src.mp4 --times "30-40" --no-subs --layout crop --out /tmp/out/nosubs
           ls -la /tmp/out
       - uses: actions/upload-artifact@v4
         with:
           name: test-shorts
-          path: /tmp/out/*.mp4
+          path: /tmp/out/**/*.mp4
           retention-days: 3

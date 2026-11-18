@@ -32,7 +32,7 @@ def probe(video: str) -> dict:
     }
 
 
-def _video_filter(w: int, h: int, layout: str, p: dict) -> str:
+def _video_filter(w: int, h: int, layout: str, p: dict, subtitles: bool = True) -> str:
     flip = "hflip," if p["flip"] else ""
     if layout == "crop":
         chain = f"[0:v]{flip}scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h}"
@@ -47,7 +47,8 @@ def _video_filter(w: int, h: int, layout: str, p: dict) -> str:
         chain += f",eq={p['eq']}"
     if p["noise"]:
         chain += f",noise=alls={p['noise']}:allf=t"
-    chain += ",subtitles=subs.ass"  # субтитры после зеркала, чтобы текст не отразился
+    if subtitles:
+        chain += ",subtitles=subs.ass"  # субтитры после зеркала, чтобы текст не отразился
     if p["speed"] != 1:
         chain += f",setpts=PTS/{p['speed']}"
     return chain + ",format=yuv420p[v]"
@@ -55,18 +56,20 @@ def _video_filter(w: int, h: int, layout: str, p: dict) -> str:
 
 def render_clip(video: str, info: dict, words: list[dict], start: float, end: float,
                 out_path: str, work_dir: str, unique: str = "light", layout: str = "blur",
-                resolution: int = config.RESOLUTION) -> str:
+                resolution: int = config.RESOLUTION, subtitles: bool = True) -> str:
     w = resolution - resolution % 2
     h = round(w * 16 / 9 / 2) * 2
     p = UNIQUE_PRESETS.get(unique, UNIQUE_PRESETS["light"])
     layout = layout if layout in LAYOUTS else "blur"
 
-    with open(os.path.join(work_dir, "subs.ass"), "w", encoding="utf-8") as f:
-        f.write(build_ass(words, start, end, w, h, font=config.SUB_FONT))
+    subtitles = subtitles and bool(words)
+    if subtitles:
+        with open(os.path.join(work_dir, "subs.ass"), "w", encoding="utf-8") as f:
+            f.write(build_ass(words, start, end, w, h, font=config.SUB_FONT))
 
     cmd = [config.FFMPEG, "-y", "-loglevel", "error",
            "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}", "-i", os.path.abspath(video),
-           "-filter_complex", _video_filter(w, h, layout, p), "-map", "[v]"]
+           "-filter_complex", _video_filter(w, h, layout, p, subtitles), "-map", "[v]"]
     if info["has_audio"]:
         cmd += ["-map", "0:a:0", "-c:a", "aac", "-b:a", "128k"]
         if p["speed"] != 1:

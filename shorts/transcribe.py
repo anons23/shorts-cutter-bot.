@@ -78,6 +78,27 @@ def transcribe(video: str, work_dir: str) -> dict:
     return {"segments": segments, "words": words}
 
 
+def transcribe_range(video: str, start: float, end: float, work_dir: str) -> list[dict]:
+    """Распознаёт речь только в отрезке [start, end]. Возвращает слова с таймкодами исходного видео.
+
+    Для ручной нарезки: отправляем в Groq пару минут звука вместо всего видео.
+    """
+    path = os.path.join(work_dir, f"range_{start:.2f}.mp3")
+    subprocess.run([config.FFMPEG, "-y", "-loglevel", "error", "-ss", f"{start:.2f}",
+                    "-t", f"{end - start:.2f}", "-i", video, "-vn", "-ac", "1", "-ar", "16000",
+                    "-c:a", "libmp3lame", "-b:a", "32k", path], check=True)
+    res = _transcribe_chunk(path)
+    os.remove(path)
+    return [{"word": w["word"].strip(), "start": w["start"] + start, "end": w["end"] + start}
+            for w in res.get("words", []) if w["word"].strip()]
+
+
+def fake_words(start: float, end: float) -> list[dict]:
+    """Фейковые слова на отрезке — для тестов без интернета."""
+    return [{**w, "start": w["start"] + start, "end": w["end"] + start}
+            for w in fake_transcript(end - start)["words"]]
+
+
 _FAKE_TEXT = (
     "Сегодня я расскажу вам одну историю которая изменила мою жизнь. "
     "Всё началось с того что я потерял работу и не знал что делать дальше. "
