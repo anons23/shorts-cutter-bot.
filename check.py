@@ -90,6 +90,17 @@ def main() -> None:
         except requests.RequestException as e:
             report(False, f"Связь с ботом через {where}",
                    f"Нет соединения ({type(e).__name__}). Проверь VPN и BOT_API_URL")
+    webapp = os.getenv("WEBAPP_URL", "")
+    if not webapp:
+        report(False, "WEBAPP_URL не задан — окна разметки не будет, только ввод в чате", warn=True)
+    elif not webapp.startswith("https://"):
+        report(False, "WEBAPP_URL начинается с https://", "Telegram открывает окна только по https")
+    else:
+        try:
+            ok = requests.get(webapp, timeout=15).status_code == 200
+        except requests.RequestException:
+            ok = False
+        report(ok, "Окно разметки открывается", "Проверь, что GitHub Pages включены и адрес верный")
     if not os.getenv("BOT_API_URL"):
         report(False, "BOT_API_URL не задан — бот примет файлы только до 20 МБ", warn=True)
 

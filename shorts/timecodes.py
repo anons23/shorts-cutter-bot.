@@ -72,3 +72,28 @@ def fit_to_duration(ranges: list[tuple[float, float]],
         else:
             ok.append((start, min(end, duration)))
     return ok, errors
+
+
+def parse_single(text: str | None) -> float | None:
+    """Одно время из сообщения: «11:24», «1124» (цифрами), «95с». Иначе None."""
+    text = (text or "").strip().lower().rstrip("сcs").strip()
+    if re.fullmatch(r"\d{3,6}", text):  # набрали цифрами без двоеточий: 1124 -> 11:24
+        d = text.zfill(4 if len(text) <= 4 else 6)
+        text = f"{d[:2]}:{d[2:]}" if len(d) == 4 else f"{d[:2]}:{d[2:4]}:{d[4:]}"
+    if not re.fullmatch(_TIME, text):
+        return None
+    try:
+        return to_seconds(text)
+    except ValueError:
+        return None
+
+
+def check_range(start: float, end: float) -> str | None:
+    """Текст ошибки или None, если отрезок подходит."""
+    if end <= start:
+        return "конец должен быть позже начала"
+    if end - start < MIN_FRAGMENT_SEC:
+        return "слишком короткий фрагмент"
+    if end - start > MAX_FRAGMENT_SEC:
+        return f"фрагмент длиннее {fmt(MAX_FRAGMENT_SEC)}"
+    return None
