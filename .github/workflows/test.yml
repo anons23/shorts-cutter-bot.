@@ -19,10 +19,12 @@ jobs:
       - name: Тесты ядра и бота
         run: python -m unittest discover tests -v
       - name: Бот импортируется без ошибок
-        run: BOT_TOKEN= DB_PATH=:memory: python -c "import bot"
+        run: |
+          BOT_TOKEN= DB_PATH=":memory:" python -c "import bot"
       - name: Установка FFmpeg
         timeout-minutes: 10
-        run: sudo apt-get install -y --no-install-recommends ffmpeg || (sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg)
+        run: |
+          sudo apt-get install -y --no-install-recommends ffmpeg || (sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg)
       - name: Пробный монтаж на тестовом видео
         run: |
           ffmpeg -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 \
