@@ -1,7 +1,9 @@
 """Тесты логики бота без Telegram (нужен aiogram): python -m unittest discover tests"""
 import asyncio
 import json
+import logging
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -65,6 +67,9 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
         storage._db.execute("DELETE FROM users")
         storage._db.execute("DELETE FROM usage")
         storage._db.execute("DELETE FROM events")
+        storage._db.execute("DELETE FROM errors")
+        bot.FOUNDERS_PREMIUM_DAYS = 0
+        bot.local_files.clear()
 
     def queued(self):
         items = []
@@ -168,6 +173,7 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(storage.used_today(UID)["fragments"], 0)
 
     async def test_referral_reward(self):
+        storage.register(1)
         start = message(uid=2, text="/start ref_1")
         await bot.start(start, SimpleNamespace(args="ref_1"))
         self.assertFalse(storage.is_premium(1))
@@ -198,6 +204,126 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
         m = message()
         await bot.stats_cmd(m)
         self.assertIn("заглушка", texts(m))
+
+    async def test_founders_get_premium(self):
+        bot.FOUNDERS_LIMIT, bot.FOUNDERS_PREMIUM_DAYS = 2, 7
+        msgs = []
+        for uid in (10, 11, 12):
+            m = message(uid=uid, text="/start")
+            await bot.start(m, SimpleNamespace(args=None))
+            msgs.append(texts(m))
+        self.assertIn("№1</b> из первых 2", msgs[0])
+        self.assertIn("№2</b>", msgs[1])
+        self.assertNotIn("первых", msgs[2])
+        self.assertTrue(storage.is_premium(10) and storage.is_premium(11))
+        self.assertFalse(storage.is_premium(12))
+        again = message(uid=10, text="/start")  # повторный /start ничего не дарит
+        await bot.start(again, SimpleNamespace(args=None))
+        self.assertNotIn("первых", texts(again))
+
+    async def test_invited_friend_gets_bonus(self):
+        storage.register(1)
+        m = message(uid=2, text="/start ref_1")
+        await bot.start(m, SimpleNamespace(args="ref_1"))
+        self.assertIn("+5 фрагментов", texts(m))
+        self.assertEqual(bot.daily_limit(2), 10)
+        fake = message(uid=3, text="/start ref_999")  # несуществующий пригласивший
+        await bot.start(fake, SimpleNamespace(args="ref_999"))
+        self.assertEqual(bot.daily_limit(3), 5)
+        self.assertIsNone(storage.get_user(3)["referrer"])
+
+    async def test_watermark_bonus_and_settings(self):
+        c = callback("set:wm:1")
+        await bot.settings_cb(c)
+        self.assertEqual(bot.daily_limit(UID), 8)
+        await bot.settings_cb(callback("set:style:neon"))
+        await bot.settings_cb(callback("set:style:hacker"))  # чужое значение игнорируем
+        self.assertEqual(bot.settings_for(UID)["style"], "neon")
+        m = message(text="/settings")
+        await bot.settings_cmd(m)
+        kb = m.answer.call_args.kwargs["reply_markup"]
+        labels = [b.text for row in kb.inline_keyboard for b in row]
+        self.assertIn("✅ Неон", labels)
+
+    async def test_process_uses_look_cache_and_share(self):
+        await bot.settings_cb(callback("set:wm:1"))
+        await bot.on_link(message(text="https://youtu.be/x"))  # регистрация
+        src = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+        src.write(b"video")
+        src.close()
+        bot.local_files["file1"] = (src.name, 0)  # уже скачано для раскадровки
+        captured = {}
+
+        def fake_cut(fragments, out, **kw):
+            captured.update(kw, fragments=fragments)
+            return [{"path": "x.mp4", "width": 720, "height": 1280, "title": "Фрагмент 1",
+                     "start": 10, "end": 20}]
+        m = message()
+        orig = (bot.probe, bot.cut_fragments)
+        bot.probe = lambda path: {"duration": 100, "has_audio": True}
+        bot.cut_fragments = fake_cut
+        try:
+            await bot.process(m, "file", "file1", [(10, 20)], {"fragments": 1})
+        finally:
+            bot.probe, bot.cut_fragments = orig
+        m.bot.download.assert_not_called()  # второй раз не скачивали
+        self.assertEqual(captured["watermark"], "@test_bot")
+        self.assertTrue(captured["hook"])
+        status = m.answer.return_value
+        markup = status.edit_text.call_args.kwargs["reply_markup"]
+        self.assertIn("t.me/share/url", markup.inline_keyboard[0][0].url)
+        self.assertIn("start%3Dref_1", markup.inline_keyboard[0][0].url)
+
+    async def test_reminders(self):
+        storage.register(1)
+        storage.touch(1)
+        storage.set_remind(1, True)
+        storage.register(2)
+        storage.touch(2)
+        storage.set_remind(2, True)
+        b = tg_bot()
+        b.send_message = AsyncMock(side_effect=[None, bot.TelegramForbiddenError(method=MagicMock(),
+                                                                                  message="blocked")])
+        self.assertEqual(await bot.send_reminders(b), 1)
+        self.assertEqual(storage.get_user(2)["blocked"], 1)
+        self.assertEqual(await bot.send_reminders(b), 0)  # второй раз за день не шлём
+
+    async def test_reminder_button(self):
+        await bot.remind_cb(callback("remind:1"))
+        self.assertEqual(storage.get_user(UID)["remind"], 1)
+        await bot.remind_cb(callback("remind:0"))
+        self.assertEqual(storage.get_user(UID)["remind"], 0)
+
+    async def test_broadcast(self):
+        bot.ADMIN_IDS = {UID}
+        for uid in (1, 2, 3):
+            storage.register(uid)
+        m = message(text="/broadcast")
+        m.reply_to_message = SimpleNamespace(chat=SimpleNamespace(id=1), message_id=77)
+        await bot.broadcast_cmd(m)
+        self.assertIn("3 пользователям", texts(m))
+        b = tg_bot()
+        b.copy_message = AsyncMock(side_effect=[None, bot.TelegramForbiddenError(method=MagicMock(),
+                                                                                  message="x"), None])
+        await bot.run_broadcast(b, UID, 1, 77)
+        self.assertEqual(b.copy_message.call_count, 3)
+        report = b.send_message.call_args.args[1]
+        self.assertIn("Доставлено: 2", report)
+        self.assertEqual(storage.get_user(2)["blocked"], 1)
+        not_admin = message(uid=5, text="/broadcast")
+        not_admin.reply_to_message = m.reply_to_message
+        await bot.broadcast_cmd(not_admin)
+        not_admin.answer.assert_not_called()
+
+    async def test_error_log(self):
+        bot.ADMIN_IDS = {UID}
+        logging.getLogger("test").error("что-то сломалось")
+        m = message(text="/errors")
+        await bot.errors_cmd(m)
+        self.assertIn("что-то сломалось", texts(m))
+        stats = message(text="/stats")
+        await bot.stats_cmd(stats)
+        self.assertIn("Ошибок за сутки: 1", texts(stats))
 
     async def test_queue_per_user(self):
         for _ in range(2):

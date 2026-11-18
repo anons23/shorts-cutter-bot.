@@ -25,6 +25,8 @@ jobs:
         timeout-minutes: 10
         run: |
           sudo apt-get install -y --no-install-recommends ffmpeg || (sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg)
+      - name: Тесты монтажа (стили, хук, кроп по лицу, раскадровка)
+        run: python -m unittest tests.test_media -v
       - name: Пробный монтаж на тестовом видео
         run: |
           ffmpeg -loglevel error -f lavfi -i testsrc2=size=1280x720:rate=30 -f lavfi -i sine=frequency=440 \
@@ -32,6 +34,7 @@ jobs:
           python clip.py /tmp/src.mp4 --fake --no-llm --clips 2 --unique strong --out /tmp/out
           python clip.py /tmp/src.mp4 --fake --times "0:10-0:25, 1:00-1:15" --out /tmp/out/manual
           python clip.py /tmp/src.mp4 --times "30-40" --no-subs --layout crop --out /tmp/out/nosubs
+          python clip.py /tmp/src.mp4 --fake --times "0:40-0:50" --style neon --position middle --watermark @test_bot --out /tmp/out/styled
           ls -la /tmp/out
       - uses: actions/upload-artifact@v4
         with:

@@ -2,3 +2,4 @@ aiogram>=3.13,<4
 requests>=2.31
 python-dotenv>=1.0
 yt-dlp>=2025.1.1
+opencv-python-headless>=4.8,<5

@@ -149,3 +149,35 @@ def find_highlights(transcript: dict, n: int, duration: float, use_llm: bool = T
     if not clips:
         return fallback_clips(segments, n, duration)
     return sorted(clips, key=lambda c: c["start"])
+
+
+HOOK_PROMPT = """Ты автор вирусных шортсов. Для каждого фрагмента ниже придумай короткий цепляющий
+заголовок (3-7 слов) на языке фрагмента, который появится крупно в начале видео.
+Без кавычек, эмодзи и хэштегов. Не выдумывай фактов, которых нет в тексте.
+
+Ответь ТОЛЬКО JSON: {{"hooks": ["заголовок 1", "заголовок 2", ...]}} — ровно {n} штук по порядку.
+
+{fragments}"""
+
+
+def generate_hooks(texts: list[str]) -> list[str]:
+    """Заголовки-хуки для фрагментов (один запрос к нейросети). Пустые строки — если не вышло."""
+    if not texts or not config.llm_ready():
+        return [""] * len(texts)
+    fragments = "\n\n".join(f"Фрагмент {i}: {t[:1500]}" for i, t in enumerate(texts, 1))
+    body = {
+        "model": config.LLM_MODEL,
+        "messages": [{"role": "user", "content": HOOK_PROMPT.format(n=len(texts), fragments=fragments)}],
+        "temperature": 0.7,
+        "response_format": {"type": "json_object"},
+    }
+    try:
+        r = requests.post(f"{config.LLM_BASE_URL.rstrip('/')}/chat/completions",
+                          headers={"Authorization": f"Bearer {config.LLM_API_KEY}"}, json=body, timeout=90)
+        text = r.json()["choices"][0]["message"]["content"] or ""
+        match = re.search(r"\{.*\}", text, re.S)
+        hooks = json.loads(match.group(0) if match else text).get("hooks", [])
+    except Exception:  # noqa: BLE001 — хук не обязателен
+        return [""] * len(texts)
+    hooks = [str(h).strip().strip('"«»')[:80] for h in hooks if isinstance(h, (str, int, float))]
+    return (hooks + [""] * len(texts))[:len(texts)]

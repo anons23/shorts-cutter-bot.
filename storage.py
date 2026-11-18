@@ -8,6 +8,10 @@ import os
 import sqlite3
 
 DB_PATH = os.getenv("DB_PATH", "bot.db")
+try:
+    TZ_OFFSET = int(os.getenv("TZ_OFFSET", "6"))  # часовой пояс относительно UTC (Омск = 6)
+except ValueError:
+    TZ_OFFSET = 6
 
 _db = sqlite3.connect(DB_PATH, check_same_thread=False)
 _db.row_factory = sqlite3.Row
@@ -19,6 +23,11 @@ CREATE TABLE IF NOT EXISTS users (
     ref_rewarded  INTEGER DEFAULT 0,  -- пригласивший уже получил награду за этого человека
     premium_until TEXT,               -- ISO-время окончания премиума
     settings      TEXT DEFAULT '{}'
+);
+CREATE TABLE IF NOT EXISTS errors (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    time TEXT,
+    text TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
     day   TEXT,
@@ -34,7 +43,23 @@ CREATE TABLE IF NOT EXISTS usage (
     PRIMARY KEY (user_id, day)
 );
 """)
+# Новые колонки добавляем и в старую базу, если она уже была создана
+_NEW_COLUMNS = {
+    "founder_no": "INTEGER",       # номер среди первых пользователей
+    "bonus_fragments": "INTEGER DEFAULT 0",
+    "bonus_until": "TEXT",         # до какого времени действует бонус приглашённому
+    "remind": "INTEGER DEFAULT 0", # напоминать, что лимит обновился
+    "last_reminded": "TEXT",
+    "last_active": "TEXT",
+    "blocked": "INTEGER DEFAULT 0",  # заблокировал бота — рассылки не шлём
+}
+_have = {r[1] for r in _db.execute("PRAGMA table_info(users)")}
+for _name, _type in _NEW_COLUMNS.items():
+    if _name not in _have:
+        _db.execute(f"ALTER TABLE users ADD COLUMN {_name} {_type}")
 _db.commit()
+
+MAX_ERRORS = 300  # храним только последние ошибки, чтобы база не росла
 
 
 def _now() -> dt.datetime:
@@ -42,7 +67,8 @@ def _now() -> dt.datetime:
 
 
 def _today() -> str:
-    return dt.date.today().isoformat()
+    """День по часовому поясу бота: лимиты обновляются в полночь по местному времени."""
+    return (_now() + dt.timedelta(hours=TZ_OFFSET)).date().isoformat()
 
 
 # --- пользователи ---------------------------------------------------------
@@ -55,6 +81,31 @@ def register(uid: int, referrer: int | None = None) -> bool:
                       (uid, _now().isoformat(), referrer))
     _db.commit()
     return cur.rowcount == 1
+
+
+def exists(uid: int) -> bool:
+    return _db.execute("SELECT 1 FROM users WHERE id = ?", (uid,)).fetchone() is not None
+
+
+def user_count() -> int:
+    return _db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+
+def make_founder(uid: int, limit: int) -> int | None:
+    """Если человек среди первых `limit` пользователей — присваиваем номер и возвращаем его."""
+    number = _db.execute("SELECT COUNT(*) FROM users WHERE rowid <= (SELECT rowid FROM users WHERE id = ?)",
+                         (uid,)).fetchone()[0]
+    if number > limit:
+        return None
+    _db.execute("UPDATE users SET founder_no = ? WHERE id = ?", (number, uid))
+    _db.commit()
+    return number
+
+
+def touch(uid: int) -> None:
+    """Отмечаем, что человек пользовался ботом (для напоминаний и статистики)."""
+    _db.execute("UPDATE users SET last_active = ?, blocked = 0 WHERE id = ?", (_now().isoformat(), uid))
+    _db.commit()
 
 
 def get_user(uid: int) -> sqlite3.Row:
@@ -96,6 +147,72 @@ def add_premium(uid: int, days: float) -> dt.datetime:
     _db.execute("UPDATE users SET premium_until = ? WHERE id = ?", (until.isoformat(), uid))
     _db.commit()
     return until
+
+
+# --- бонус приглашённому -------------------------------------------------
+
+def give_bonus(uid: int, fragments: int, hours: float = 24) -> None:
+    until = _now() + dt.timedelta(hours=hours)
+    _db.execute("UPDATE users SET bonus_fragments = ?, bonus_until = ? WHERE id = ?",
+                (fragments, until.isoformat(), uid))
+    _db.commit()
+
+
+def bonus_fragments(uid: int) -> int:
+    row = get_user(uid)
+    if not row["bonus_until"] or dt.datetime.fromisoformat(row["bonus_until"]) <= _now():
+        return 0
+    return row["bonus_fragments"] or 0
+
+
+# --- напоминания и рассылки ----------------------------------------------
+
+def set_remind(uid: int, on: bool) -> None:
+    register(uid)
+    _db.execute("UPDATE users SET remind = ? WHERE id = ?", (int(on), uid))
+    _db.commit()
+
+
+def reminder_targets(active_days: int = 30) -> list[int]:
+    """Кому сегодня напомнить: включили напоминания, не заблокировали бота, недавно заходили,
+    сегодня ещё не напоминали и сегодня ещё ничего не резали."""
+    since = (_now() - dt.timedelta(days=active_days)).isoformat()
+    rows = _db.execute("""SELECT id FROM users WHERE remind = 1 AND blocked = 0
+                          AND last_active >= ? AND COALESCE(last_reminded, '') != ?
+                          AND id NOT IN (SELECT user_id FROM usage WHERE day = ? AND fragments > 0)""",
+                       (since, _today(), _today())).fetchall()
+    return [r[0] for r in rows]
+
+
+def mark_reminded(uid: int) -> None:
+    _db.execute("UPDATE users SET last_reminded = ? WHERE id = ?", (_today(), uid))
+    _db.commit()
+
+
+def set_blocked(uid: int) -> None:
+    _db.execute("UPDATE users SET blocked = 1, remind = 0 WHERE id = ?", (uid,))
+    _db.commit()
+
+
+def broadcast_targets() -> list[int]:
+    return [r[0] for r in _db.execute("SELECT id FROM users WHERE blocked = 0 ORDER BY id")]
+
+
+# --- журнал ошибок --------------------------------------------------------
+
+def log_error(text: str) -> None:
+    _db.execute("INSERT INTO errors (time, text) VALUES (?, ?)", (_now().isoformat(), text[:3000]))
+    _db.execute("DELETE FROM errors WHERE id <= (SELECT MAX(id) FROM errors) - ?", (MAX_ERRORS,))
+    _db.commit()
+
+
+def recent_errors(limit: int = 10) -> list[sqlite3.Row]:
+    return _db.execute("SELECT time, text FROM errors ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+
+
+def errors_since(hours: float = 24) -> int:
+    since = (_now() - dt.timedelta(hours=hours)).isoformat()
+    return _db.execute("SELECT COUNT(*) FROM errors WHERE time >= ?", (since,)).fetchone()[0]
 
 
 # --- дневные лимиты -------------------------------------------------------
@@ -151,4 +268,8 @@ def stats() -> dict:
                            FROM usage WHERE day = ?""", (_today(),)).fetchone()
     return {"users": users, "premium": premium, "active_today": today[0],
             "fragments_today": today[1], "auto_today": today[2],
-            "buy_clicks_today": event_count("buy_click", True), "buy_clicks": event_count("buy_click")}
+            "buy_clicks_today": event_count("buy_click", True), "buy_clicks": event_count("buy_click"),
+            "blocked": _db.execute("SELECT COUNT(*) FROM users WHERE blocked = 1").fetchone()[0],
+            "remind": _db.execute("SELECT COUNT(*) FROM users WHERE remind = 1").fetchone()[0],
+            "founders": _db.execute("SELECT COUNT(*) FROM users WHERE founder_no IS NOT NULL").fetchone()[0],
+            "errors_24h": errors_since(24)}

@@ -12,6 +12,7 @@ import sys
 from shorts import config
 from shorts.pipeline import cut_fragments, make_shorts
 from shorts.render import probe
+from shorts.subtitles import POSITIONS, STYLES
 from shorts.timecodes import parse_ranges
 
 
@@ -29,8 +30,15 @@ def main() -> None:
     ap.add_argument("--no-llm", action="store_true", help="выбирать моменты без нейросети")
     ap.add_argument("--times", help='свои тайминги, например "0:45-1:20, 3:10-3:55"')
     ap.add_argument("--no-subs", action="store_true", help="без субтитров")
+    ap.add_argument("--style", choices=list(STYLES), default="classic", help="стиль субтитров")
+    ap.add_argument("--position", choices=list(POSITIONS), default="bottom", help="где субтитры")
+    ap.add_argument("--hook", action="store_true", help="заголовок-хук сверху (нужна нейросеть)")
+    ap.add_argument("--watermark", default="", help="водяной знак, например @my_bot")
+    ap.add_argument("--no-face", action="store_true", help="в режиме crop не искать лицо")
     a = ap.parse_args()
 
+    look = {"style": a.style, "position": a.position, "hook": a.hook, "watermark": a.watermark,
+            "face": not a.no_face}
     try:
         if a.times:
             ranges, errors = parse_ranges(a.times, probe(a.video)["duration"])
@@ -40,12 +48,12 @@ def main() -> None:
                 raise ValueError('не нашёл ни одного тайминга. Пример: --times "1:20-1:45, 3:00-3:30"')
             fragments = [{"video": a.video, "start": s, "end": e} for s, e in ranges]
             results = cut_fragments(fragments, a.out, subtitles=not a.no_subs, fake=a.fake,
-                                    unique=a.unique, layout=a.layout, resolution=a.res, progress=print)
+                                    unique=a.unique, layout=a.layout, resolution=a.res, progress=print, **look)
         else:
             results = make_shorts(a.video, a.out, n_clips=a.clips, transcript_path=a.transcript,
                                   fake=a.fake, use_llm=not a.no_llm, unique=a.unique,
                                   layout=a.layout, resolution=a.res, subtitles=not a.no_subs,
-                                  progress=print)
+                                  progress=print, **look)
     except Exception as e:  # noqa: BLE001
         print(f"❌ Ошибка: {e}", file=sys.stderr)
         sys.exit(1)

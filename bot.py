@@ -6,6 +6,7 @@
 Премиум можно получить за приглашённых друзей (временный) или выдать командой /give.
 """
 import asyncio
+import datetime as dt
 import glob
 import json
 import logging
@@ -15,12 +16,12 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import SimpleFilesPathWrapper, TelegramAPIServer
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (BotCommand, CallbackQuery, FSInputFile, InlineKeyboardButton,
                            InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup,
@@ -33,7 +34,9 @@ import payments  # noqa: E402
 import storage  # noqa: E402 — путь к базе берётся из .env
 from shorts import config  # noqa: E402
 from shorts.pipeline import ServiceNotReady, cut_fragments, make_shorts  # noqa: E402
+from shorts import storyboard  # noqa: E402
 from shorts.render import probe  # noqa: E402
+from shorts.subtitles import POSITIONS, STYLES  # noqa: E402
 from shorts.timecodes import (MAX_FRAGMENT_SEC, MAX_FRAGMENTS, check_range,  # noqa: E402
                               fit_to_duration, fmt, has_timecodes, parse_ranges, parse_single)
 
@@ -59,6 +62,12 @@ FREE_FRAGMENTS_PER_DAY = _env_int("FREE_FRAGMENTS_PER_DAY", 5)      # беспл
 PREMIUM_FRAGMENTS_PER_DAY = _env_int("PREMIUM_FRAGMENTS_PER_DAY", 0)  # премиум: 0 — без лимита
 PREMIUM_AUTO_PER_DAY = _env_int("PREMIUM_AUTO_PER_DAY", 5)          # премиум: авто-нарезок в день
 REF_PREMIUM_DAYS = _env_int("REF_PREMIUM_DAYS", 3)  # дней премиума за приглашённого активного друга
+FOUNDERS_LIMIT = _env_int("FOUNDERS_LIMIT", 300)          # первые N пользователей — «основатели»
+FOUNDERS_PREMIUM_DAYS = _env_int("FOUNDERS_PREMIUM_DAYS", 7)  # их подарок: дней Премиума
+REF_FRIEND_BONUS = _env_int("REF_FRIEND_BONUS", 5)  # приглашённому: +фрагментов на первые сутки
+WATERMARK_BONUS = _env_int("WATERMARK_BONUS", 3)    # +фрагментов в день, если включил водяной знак
+REMIND_HOUR = _env_int("REMIND_HOUR", 10)           # во сколько напоминать о лимите (местное время)
+TZ_OFFSET = _env_int("TZ_OFFSET", 6)                # часовой пояс относительно UTC (Омск = 6)
 MAX_VIDEO_MIN = _env_int("MAX_VIDEO_MIN", 90)
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 
@@ -66,6 +75,9 @@ YT_RE = re.compile(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)/\S+")
 YT_ID_RE = re.compile(r"(?:v=|youtu\.be/|shorts/|live/|embed/)([\w-]{11})")
 MAX_QUEUE_PER_USER = 2  # сколько задач один человек может держать в очереди
 DRAFT_TTL = 3600        # через час недоделанную разметку забываем
+CACHE_DIR = os.path.join(tempfile.gettempdir(), "shorts_cache")  # скачанные для раскадровки видео
+local_files: dict[str, tuple[str, float]] = {}  # {file_id: (путь, когда скачан)}
+broadcasts: dict[int, tuple[int, int]] = {}     # {admin_id: (chat_id, message_id)} — ждут подтверждения
 
 pending: dict[int, int] = {}  # {user_id: сколько задач ждёт в очереди}
 # Видео, по которому человек ещё выбирает режим или размечает тайминги
@@ -89,10 +101,17 @@ def fragments_left(uid: int) -> int:
     """Сколько фрагментов ещё можно нарезать сегодня (не больше MAX_FRAGMENTS за раз)."""
     if is_admin(uid):
         return MAX_FRAGMENTS
-    limit = PREMIUM_FRAGMENTS_PER_DAY if storage.is_premium(uid) else FREE_FRAGMENTS_PER_DAY
-    if limit <= 0:
-        return MAX_FRAGMENTS
-    return max(0, min(MAX_FRAGMENTS, limit - storage.used_today(uid)["fragments"]))
+    return max(0, min(MAX_FRAGMENTS, daily_limit(uid) - storage.used_today(uid)["fragments"]))
+
+
+def daily_limit(uid: int) -> int:
+    """Сколько фрагментов в день доступно человеку с учётом всех бонусов."""
+    if storage.is_premium(uid):
+        return PREMIUM_FRAGMENTS_PER_DAY if PREMIUM_FRAGMENTS_PER_DAY > 0 else 10 ** 6
+    limit = FREE_FRAGMENTS_PER_DAY + storage.bonus_fragments(uid)
+    if settings_for(uid).get("wm"):
+        limit += WATERMARK_BONUS
+    return limit
 
 
 def auto_left(uid: int) -> int:
@@ -129,33 +148,82 @@ def plans_keyboard() -> InlineKeyboardMarkup:
 
 async def limit_reached(m: Message, uid: int) -> None:
     link = await ref_link(m.bot, uid)
+    rows = []
+    if not storage.get_user(uid)["remind"]:
+        rows.append([InlineKeyboardButton(text="🔔 Напомнить, когда лимит обновится",
+                                          callback_data="remind:1")])
+    if not settings_for(uid).get("wm") and WATERMARK_BONUS > 0:
+        rows.append([InlineKeyboardButton(text=f"💧 +{WATERMARK_BONUS} фрагм. в день за водяной знак",
+                                          callback_data="set:wm:1")])
+    rows.append([InlineKeyboardButton(text="📤 Пригласить друга", url=share_url(link))])
     await m.answer(
         "⏳ Бесплатные фрагменты на сегодня закончились — завтра будут новые!\n\n"
         f"🎁 Не хочешь ждать? Пригласи друга и получи {REF_PREMIUM_DAYS} дн. Премиума "
-        f"с безлимитной нарезкой:\n{link}", disable_web_page_preview=True)
+        f"с безлимитной нарезкой:\n{link}", disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+def share_url(link: str) -> str:
+    """Ссылка «Поделиться»: Telegram откроет выбор чата с готовым текстом."""
+    text = ("Нашёл бота, который режет длинные видео на шортсы с субтитрами 🔥 "
+            f"По ссылке — +{REF_FRIEND_BONUS} бесплатных фрагментов")
+    return f"https://t.me/share/url?url={quote(link)}&text={quote(text)}"
 
 
 # ------------------------------------------------------------- настройки ----
 
+SETTING_DEFAULTS = {"unique": "light", "layout": "blur", "clips": config.DEFAULT_CLIPS, "subs": 1,
+                    "style": "classic", "pos": "bottom", "hook": 1, "wm": 0}
+SETTING_VALUES = {"unique": ("none", "light", "strong"), "layout": ("blur", "crop"),
+                  "clips": ("3", "5", "8"), "subs": ("0", "1"), "style": tuple(STYLES),
+                  "pos": tuple(POSITIONS), "hook": ("0", "1"), "wm": ("0", "1")}
+INT_SETTINGS = ("clips", "subs", "hook", "wm")
+
+
 def settings_for(uid: int) -> dict:
     s = storage.get_settings(uid)
-    for key, value in (("unique", "light"), ("layout", "blur"),
-                       ("clips", config.DEFAULT_CLIPS), ("subs", 1)):
+    for key, value in SETTING_DEFAULTS.items():
         s.setdefault(key, value)
     return s
 
 
-def settings_keyboard(s: dict) -> InlineKeyboardMarkup:
+def settings_text(uid: int) -> str:
+    wm = (f"💧 Водяной знак — маленькая надпись с ботом в углу. За него +{WATERMARK_BONUS} "
+          "бесплатных фрагмента в день." if WATERMARK_BONUS > 0 and not has_premium(uid) else "")
+    return ("⚙️ <b>Настройки нарезки</b>\n\n"
+            "🪝 Хук — крупный заголовок на первые 3 секунды, его придумывает ИИ.\n"
+            "✂️ «Обрезка» сама держит лицо в центре кадра.\n" + wm)
+
+
+def settings_keyboard(s: dict, uid: int | None = None) -> InlineKeyboardMarkup:
     def btn(text: str, key: str, value) -> InlineKeyboardButton:
         mark = "✅ " if s[key] == value else ""
         return InlineKeyboardButton(text=mark + text, callback_data=f"set:{key}:{value}")
-    return InlineKeyboardMarkup(inline_keyboard=[
+
+    def toggle(text: str, key: str) -> InlineKeyboardButton:
+        on = bool(s[key])
+        return InlineKeyboardButton(text=("✅ " if on else "▫️ ") + text,
+                                    callback_data=f"set:{key}:{0 if on else 1}")
+
+    styles = [btn(v["title"], "style", k) for k, v in STYLES.items()]
+    rows = [
+        [InlineKeyboardButton(text="— Стиль субтитров —", callback_data="noop")],
+        styles[:3], styles[3:],
+        [btn("Внизу", "pos", "bottom"), btn("По центру", "pos", "middle")],
+        [toggle("💬 Субтитры", "subs"), toggle("🪝 Хук", "hook")],
+        [InlineKeyboardButton(text="— Видео —", callback_data="noop")],
+        [btn("Размытый фон", "layout", "blur"), btn("Обрезка", "layout", "crop")],
         [btn("Без уникализации", "unique", "none"), btn("Лёгкая", "unique", "light"),
          btn("Сильная", "unique", "strong")],
-        [btn("Размытый фон", "layout", "blur"), btn("Обрезка", "layout", "crop")],
-        [btn("💬 С субтитрами", "subs", 1), btn("Без субтитров", "subs", 0)],
         [btn("Авто: 3 шортса", "clips", 3), btn("5", "clips", 5), btn("8", "clips", 8)],
-    ])
+        [toggle(f"💧 Водяной знак (+{WATERMARK_BONUS}/день)" if WATERMARK_BONUS > 0 else "💧 Водяной знак",
+                "wm")],
+    ]
+    if uid is not None:
+        remind = bool(storage.get_user(uid)["remind"])
+        rows.append([InlineKeyboardButton(text=("✅ " if remind else "▫️ ") + "🔔 Напоминать о новом лимите",
+                                          callback_data=f"remind:{0 if remind else 1}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # --------------------------------------------------------------- команды ----
@@ -165,7 +233,10 @@ async def start(m: Message, command: CommandObject | None = None) -> None:
     uid = m.from_user.id
     args = (command.args or "") if command else ""
     referrer = int(args[4:]) if args.startswith("ref_") and args[4:].isdigit() else None
-    storage.register(uid, referrer)
+    if referrer is not None and (referrer == uid or not storage.exists(referrer)):
+        referrer = None  # приглашение от несуществующего пользователя не считаем
+    is_new = storage.register(uid, referrer)
+    storage.touch(uid)
     await m.answer(
         "👋 Привет! Я режу длинные видео на вертикальные шортсы с субтитрами.\n\n"
         "1️⃣ Пришли видео файлом или ссылку на YouTube\n"
@@ -175,6 +246,24 @@ async def start(m: Message, command: CommandObject | None = None) -> None:
         "👑 Премиум: авто-нарезка — бот сам найдёт лучшие моменты\n\n"
         "/limit — остаток на сегодня · /ref — пригласить друга · /settings — настройки\n\n"
         "Загружай только видео, на которые у тебя есть права.")
+    if not is_new:
+        return
+    if referrer and REF_FRIEND_BONUS > 0:
+        storage.give_bonus(uid, REF_FRIEND_BONUS)
+        await m.answer(f"🎁 Тебя пригласил друг — держи <b>+{REF_FRIEND_BONUS} фрагментов</b> "
+                       "на первые сутки!", parse_mode="HTML")
+    number = storage.make_founder(uid, FOUNDERS_LIMIT) if FOUNDERS_PREMIUM_DAYS > 0 else None
+    if number:
+        until = storage.add_premium(uid, FOUNDERS_PREMIUM_DAYS)
+        await m.answer(
+            "🏆 <b>Ты в числе первых!</b>\n\n"
+            f"Ты — <b>№{number}</b> из первых {FOUNDERS_LIMIT} пользователей бота. "
+            "Спасибо, что пришёл так рано 🙌\n\n"
+            f"🎁 Дарим тебе <b>{FOUNDERS_PREMIUM_DAYS} дней Премиума</b> — до {until:%d.%m}:\n"
+            "🤖 авто-нарезка: бот сам найдёт лучшие моменты\n"
+            "✂️ нарезка по своим таймингам без дневного лимита\n\n"
+            f"Осталось мест среди первых: {max(0, FOUNDERS_LIMIT - number)}. "
+            "Расскажи друзьям, пока места есть 😉", parse_mode="HTML")
 
 
 @dp.message(Command("limit"))
@@ -191,7 +280,11 @@ async def limit_cmd(m: Message) -> None:
                                         else f"осталось {fragments_left(uid)}"))
     else:
         lines.append(f"✂️ Бесплатных фрагментов сегодня осталось: {fragments_left(uid)} "
-                     f"из {FREE_FRAGMENTS_PER_DAY}")
+                     f"из {daily_limit(uid)}")
+        if storage.bonus_fragments(uid):
+            lines.append(f"🎁 Из них бонус от друга: +{storage.bonus_fragments(uid)}")
+        if settings_for(uid).get("wm") and WATERMARK_BONUS > 0:
+            lines.append(f"💧 За водяной знак: +{WATERMARK_BONUS}")
         lines.append("🔄 Лимит обновляется каждый день.\n👑 Премиум — /premium")
     await m.answer("\n".join(lines))
 
@@ -270,8 +363,83 @@ async def stats_cmd(m: Message) -> None:
                    f"📅 Активны сегодня: {s['active_today']}\n"
                    f"✂️ Фрагментов сегодня: {s['fragments_today']}\n🤖 Авто сегодня: {s['auto_today']}\n"
                    f"⏳ В очереди: {queue.qsize()}\n"
-                   f"💳 Нажали «Купить»: сегодня {s['buy_clicks_today']}, всего {s['buy_clicks']}\n\n"
+                   f"💳 Нажали «Купить»: сегодня {s['buy_clicks_today']}, всего {s['buy_clicks']}\n"
+                   f"🏆 Основателей: {s['founders']} из {FOUNDERS_LIMIT}\n"
+                   f"🔔 С напоминаниями: {s['remind']}\n🚫 Заблокировали бота: {s['blocked']}\n"
+                   f"❗ Ошибок за сутки: {s['errors_24h']}" + (" — /errors" if s['errors_24h'] else "") + "\n\n"
                    + services_text())
+
+
+@dp.message(Command("errors"))
+async def errors_cmd(m: Message) -> None:
+    """Админ: последние ошибки бота."""
+    if not is_admin(m.from_user.id):
+        return
+    rows = storage.recent_errors(8)
+    if not rows:
+        await m.answer("✅ Ошибок нет")
+        return
+    parts = []
+    for r in rows:
+        when = dt.datetime.fromisoformat(r["time"]) + dt.timedelta(hours=TZ_OFFSET)
+        parts.append(f"🕐 {when:%d.%m %H:%M}\n{r['text'][-600:]}")
+    await m.answer("❗ Последние ошибки (новые сверху):\n\n" + "\n\n".join(parts)[-4000:])
+
+
+@dp.message(Command("broadcast"))
+async def broadcast_cmd(m: Message) -> None:
+    """Админ: ответь этой командой на сообщение — бот разошлёт его всем (после подтверждения)."""
+    if not is_admin(m.from_user.id):
+        return
+    src = m.reply_to_message
+    if not src:
+        await m.answer("📣 Напиши сообщение для рассылки (можно с фото или видео), "
+                       "потом ответь на него командой /broadcast.")
+        return
+    broadcasts[m.from_user.id] = (src.chat.id, src.message_id)
+    total = len(storage.broadcast_targets())
+    await m.answer(f"📣 Разослать это сообщение {total} пользователям?",
+                   reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                       InlineKeyboardButton(text=f"✅ Отправить ({total})", callback_data="bc:go"),
+                       InlineKeyboardButton(text="✖️ Отмена", callback_data="bc:cancel")]]))
+
+
+@dp.callback_query(F.data.startswith("bc:"))
+async def broadcast_cb(c: CallbackQuery) -> None:
+    uid = c.from_user.id
+    if not is_admin(uid):
+        await c.answer()
+        return
+    await c.answer()
+    await _hide_buttons(c.message)
+    src = broadcasts.pop(uid, None)
+    if c.data == "bc:cancel" or not src:
+        await c.message.answer("Рассылка отменена.")
+        return
+    await c.message.answer("📣 Рассылка началась, пришлю отчёт.")
+    asyncio.create_task(run_broadcast(c.bot, uid, *src))
+
+
+async def run_broadcast(bot: Bot, admin_id: int, chat_id: int, message_id: int) -> None:
+    sent = blocked = failed = 0
+    for target in storage.broadcast_targets():
+        for _ in range(3):
+            try:
+                await bot.copy_message(target, chat_id, message_id)
+                sent += 1
+                break
+            except TelegramRetryAfter as e:  # Telegram просит подождать
+                await asyncio.sleep(e.retry_after + 1)
+            except TelegramForbiddenError:
+                storage.set_blocked(target)
+                blocked += 1
+                break
+            except Exception:  # noqa: BLE001
+                failed += 1
+                break
+        await asyncio.sleep(0.05)  # не больше ~20 сообщений в секунду
+    await bot.send_message(admin_id, f"📣 Рассылка готова\n✅ Доставлено: {sent}\n"
+                                     f"🚫 Заблокировали бота: {blocked}\n⚠️ Ошибки: {failed}")
 
 
 def services_text() -> str:
@@ -289,25 +457,49 @@ def services_text() -> str:
 
 @dp.message(Command("settings"))
 async def settings_cmd(m: Message) -> None:
-    await m.answer("Настройки нарезки:", reply_markup=settings_keyboard(settings_for(m.from_user.id)))
+    uid = m.from_user.id
+    await m.answer(settings_text(uid), parse_mode="HTML",
+                   reply_markup=settings_keyboard(settings_for(uid), uid))
 
 
 @dp.callback_query(F.data.startswith("set:"))
 async def settings_cb(c: CallbackQuery) -> None:
     _, key, value = c.data.split(":", 2)
-    s = settings_for(c.from_user.id)
-    allowed = {"unique": ("none", "light", "strong"), "layout": ("blur", "crop"),
-               "clips": ("3", "5", "8"), "subs": ("0", "1")}
-    if value not in allowed.get(key, ()):
+    uid = c.from_user.id
+    s = settings_for(uid)
+    if value not in SETTING_VALUES.get(key, ()):
         await c.answer()
         return
-    s[key] = int(value) if key in ("clips", "subs") else value
-    storage.save_settings(c.from_user.id, s)
+    s[key] = int(value) if key in INT_SETTINGS else value
+    storage.save_settings(uid, s)
+    note = "Сохранено"
+    if key == "wm" and s["wm"] and WATERMARK_BONUS > 0 and not has_premium(uid):
+        note = f"💧 +{WATERMARK_BONUS} фрагмента в день — уже сегодня!"
     try:
-        await c.message.edit_reply_markup(reply_markup=settings_keyboard(s))
+        if c.message.text and c.message.text.startswith("⚙️"):
+            await c.message.edit_reply_markup(reply_markup=settings_keyboard(s, uid))
     except TelegramBadRequest:
         pass
-    await c.answer("Сохранено")
+    await c.answer(note, show_alert=key == "wm" and bool(s["wm"]))
+
+
+@dp.callback_query(F.data.startswith("remind:"))
+async def remind_cb(c: CallbackQuery) -> None:
+    on = c.data == "remind:1"
+    storage.set_remind(c.from_user.id, on)
+    await c.answer(f"🔔 Напомню в {REMIND_HOUR}:00, когда лимит обновится" if on else "Напоминания выключены",
+                   show_alert=on)
+    try:
+        if c.message.text and c.message.text.startswith("⚙️"):
+            await c.message.edit_reply_markup(
+                reply_markup=settings_keyboard(settings_for(c.from_user.id), c.from_user.id))
+    except TelegramBadRequest:
+        pass
+
+
+@dp.callback_query(F.data == "noop")
+async def noop_cb(c: CallbackQuery) -> None:
+    await c.answer()
 
 
 @dp.message(Command("cancel"))
@@ -440,6 +632,48 @@ async def start_manual(m: Message, uid: int, d: dict) -> None:
     await m.answer(f"✂️ Можно нарезать до {left} {_plural(left)}.\n\n{window}"
                    "<b>Фрагмент 1.</b> Пришли время начала, например <code>11:24</code>",
                    parse_mode="HTML", reply_markup=manual_keyboard(uid, d))
+    if d["kind"] == "file" and storyboard.available():
+        await m.answer("Не помнишь, где нужные моменты? Покажу кадры с таймкодами 👇",
+                       reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                           InlineKeyboardButton(text="🖼 Раскадровка", callback_data="board")]]))
+
+
+@dp.callback_query(F.data == "board")
+async def board_cb(c: CallbackQuery) -> None:
+    uid = c.from_user.id
+    d = _draft(uid)
+    if not d or d["kind"] != "file":
+        await c.answer("Пришли видео ещё раз", show_alert=True)
+        return
+    await c.answer()
+    await _hide_buttons(c.message)
+    status = await c.message.answer("🖼 Готовлю раскадровку...")
+    try:
+        path = await cached_file(c.bot, d["payload"])
+        info = await asyncio.to_thread(probe, path)
+        d["duration"] = info["duration"]
+        board = path + ".jpg"
+        await asyncio.to_thread(storyboard.make_storyboard, path, info["duration"], board)
+        await c.message.answer_photo(FSInputFile(board), caption=(
+            f"🖼 Видео длится {fmt(info['duration'])}. Время каждого кадра — в углу.\n"
+            "Пришли время начала фрагмента, например <code>1:20</code>"), parse_mode="HTML")
+        os.remove(board)
+        await status.delete()
+    except Exception as e:  # noqa: BLE001
+        logging.exception("Не удалось сделать раскадровку")
+        await _safe_edit(status, f"😔 Не получилось сделать раскадровку: {str(e)[:200]}")
+
+
+async def cached_file(bot: Bot, file_id: str) -> str:
+    """Скачивает видео один раз: потом его же возьмёт нарезка, второй раз качать не нужно."""
+    path, _ = local_files.get(file_id, ("", 0))
+    if path and os.path.exists(path):
+        return path
+    os.makedirs(CACHE_DIR, exist_ok=True)
+    path = os.path.join(CACHE_DIR, f"{abs(hash(file_id))}_{int(time.time())}.mp4")
+    await bot.download(file_id, destination=path)
+    local_files[file_id] = (path, time.time())
+    return path
 
 
 def length_keyboard() -> InlineKeyboardMarkup:
@@ -622,6 +856,7 @@ async def enqueue(m: Message, kind: str, payload: str,
     if pending.get(uid, 0) >= MAX_QUEUE_PER_USER and not is_admin(uid):
         await m.answer("⏳ Дождись, пока обработаются предыдущие видео.")
         return
+    storage.touch(uid)
     # списываем лимит сразу, чтобы его нельзя было обойти очередью; при ошибке вернём
     charge = {"fragments": len(ranges)} if ranges else {"auto": 1}
     storage.add_usage(uid, **charge)
@@ -694,8 +929,10 @@ async def process(m: Message, kind: str, payload: str, ranges: list[tuple[float,
 
     work = tempfile.mkdtemp(prefix="job_")
     s = settings_for(uid)
+    me = await m.bot.me()
     style = {"unique": s["unique"], "layout": s["layout"], "subtitles": bool(s["subs"]),
-             "progress": progress}
+             "style": s["style"], "position": s["pos"], "hook": bool(s["hook"]),
+             "watermark": f"@{me.username}" if s["wm"] else "", "progress": progress}
     done = False
     try:
         fragments, errors = None, []
@@ -709,7 +946,11 @@ async def process(m: Message, kind: str, payload: str, ranges: list[tuple[float,
         if fragments is None:
             if kind == "file":
                 src = os.path.join(work, "source.mp4")
-                await m.bot.download(payload, destination=src)
+                cached, _ = local_files.pop(payload, ("", 0))
+                if cached and os.path.exists(cached):
+                    shutil.move(cached, src)  # уже скачано для раскадровки
+                else:
+                    await m.bot.download(payload, destination=src)
             else:
                 src = await asyncio.to_thread(download_youtube, payload, work)
             info = await asyncio.to_thread(probe, src)
@@ -748,7 +989,10 @@ async def process(m: Message, kind: str, payload: str, ranges: list[tuple[float,
             tail += "\n💬 Субтитры появятся, когда подключим распознавание речи."
         if not has_premium(uid):
             tail = f"\n✂️ Бесплатных фрагментов на сегодня: {fragments_left(uid)}"
-        await _safe_edit(status, "✅ Готово! Присылай следующее видео." + tail)
+        link = await ref_link(m.bot, uid)
+        await _safe_edit(status, "✅ Готово! Присылай следующее видео." + tail,
+                         InlineKeyboardMarkup(inline_keyboard=[[
+                             InlineKeyboardButton(text="📤 Поделиться ботом с другом", url=share_url(link))]]))
         await reward_referrer(m.bot, uid)
     except ServiceNotReady:
         await _safe_edit(status, "🤖 Эта функция скоро заработает — подключаем ИИ. Лимит вернул.")
@@ -775,9 +1019,9 @@ async def reward_referrer(bot: Bot, uid: int) -> None:
         pass
 
 
-async def _safe_edit(msg: Message, text: str) -> None:
+async def _safe_edit(msg: Message, text: str, markup: InlineKeyboardMarkup | None = None) -> None:
     try:
-        await msg.edit_text(text)
+        await msg.edit_text(text, reply_markup=markup)
     except TelegramBadRequest:
         pass
 
@@ -794,6 +1038,74 @@ async def worker() -> None:
             uid = m.from_user.id
             pending[uid] = max(0, pending.get(uid, 0) - 1)
             queue.task_done()
+
+
+def local_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=TZ_OFFSET)
+
+
+async def send_reminders(bot: Bot) -> int:
+    """Напоминаем тем, кто сам включил: лимит обновился. Возвращает, скольким отправили."""
+    sent = 0
+    off = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🔕 Не напоминать", callback_data="remind:0")]])
+    for uid in storage.reminder_targets():
+        storage.mark_reminded(uid)
+        if has_premium(uid):
+            continue  # у Премиума лимита нет — напоминать не о чем
+        try:
+            await bot.send_message(uid, f"🔄 Лимит обновился! Сегодня снова {daily_limit(uid)} "
+                                        "бесплатных фрагментов ✂️\nПрисылай видео 🎬", reply_markup=off)
+            sent += 1
+        except TelegramForbiddenError:
+            storage.set_blocked(uid)
+        except Exception:  # noqa: BLE001
+            logging.exception("Не удалось отправить напоминание")
+        await asyncio.sleep(0.05)
+    return sent
+
+
+def clean_cache(max_age: float = 2 * DRAFT_TTL) -> None:
+    """Удаляем видео, скачанные для раскадровки и так и не нарезанные."""
+    now = time.time()
+    for file_id, (path, when) in list(local_files.items()):
+        if now - when > max_age:
+            local_files.pop(file_id, None)
+    if os.path.isdir(CACHE_DIR):
+        for name in os.listdir(CACHE_DIR):
+            path = os.path.join(CACHE_DIR, name)
+            try:
+                if now - os.path.getmtime(path) > max_age:
+                    os.remove(path)
+            except OSError:
+                pass
+
+
+async def background(bot: Bot) -> None:
+    """Раз в 10 минут: напоминания о лимите (после REMIND_HOUR) и уборка временных файлов."""
+    while True:
+        try:
+            if local_now().hour >= REMIND_HOUR:
+                await send_reminders(bot)
+            clean_cache()
+        except Exception:  # noqa: BLE001
+            logging.exception("Сбой фоновой задачи")
+        await asyncio.sleep(600)
+
+
+class DBErrorLog(logging.Handler):
+    """Пишет ошибки в базу — их видно в /errors и /stats с телефона."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            storage.log_error(self.format(record))
+        except Exception:  # noqa: BLE001 — журнал не должен ронять бота
+            pass
+
+
+_error_log = DBErrorLog(level=logging.ERROR)
+_error_log.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+logging.getLogger().addHandler(_error_log)
 
 
 async def main() -> None:
@@ -819,6 +1131,7 @@ async def main() -> None:
         BotCommand(command="cancel", description="Отменить разметку"),
     ])
     asyncio.create_task(worker())
+    asyncio.create_task(background(bot))
     await dp.start_polling(bot)
 
 
