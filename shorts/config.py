@@ -35,3 +35,14 @@ FFMPEG = os.getenv("FFMPEG", "ffmpeg")
 FFPROBE = os.getenv("FFPROBE", "ffprobe")
 VIDEO_ENCODER = os.getenv("VIDEO_ENCODER", "libx264")  # h264_nvenc для видеокарт NVIDIA
 SUB_FONT = os.getenv("SUB_FONT", "Arial")
+
+
+# --- Какие внешние сервисы подключены (без ключа включается заглушка) ---
+def speech_ready() -> bool:
+    """Распознавание речи (субтитры, авто-нарезка)."""
+    return bool(GROQ_API_KEY)
+
+
+def llm_ready() -> bool:
+    """Нейросеть для выбора моментов. Без неё — простой выбор по плотности речи."""
+    return bool(LLM_API_KEY)

@@ -60,8 +60,11 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
         bot.queue = asyncio.Queue()
         bot.ADMIN_IDS = set()
         bot.FREE_FRAGMENTS_PER_DAY = 5
+        bot.config.GROQ_API_KEY = ""
+        bot.config.LLM_API_KEY = ""
         storage._db.execute("DELETE FROM users")
         storage._db.execute("DELETE FROM usage")
+        storage._db.execute("DELETE FROM events")
 
     def queued(self):
         items = []
@@ -131,6 +134,12 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("start=ref_1", texts(c.message))
 
         storage.add_premium(UID, 1)
+        stub = callback("mode:auto")
+        await bot.mode_cb(stub)  # ИИ не подключён — заглушка
+        self.assertIn("скоро", texts(stub.message))
+        self.assertEqual(self.queued(), [])
+
+        bot.config.GROQ_API_KEY = "test"
         await bot.mode_cb(callback("mode:auto"))
         (_, _, _, ranges, charge), = self.queued()
         self.assertIsNone(ranges)
@@ -173,6 +182,22 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
         await bot.start(message(text="/start ref_1"), SimpleNamespace(args="ref_1"))
         await bot.reward_referrer(tg_bot(), 1)
         self.assertFalse(storage.is_premium(1))
+
+    async def test_buy_stub_counts_interest(self):
+        c = callback("buy:30")
+        await bot.buy_cb(c)
+        self.assertIn("скоро", texts(c.message))
+        self.assertEqual(storage.event_count("buy_click"), 1)
+        menu = callback("buy:menu")
+        await bot.buy_cb(menu)
+        kb = menu.message.answer.call_args.kwargs["reply_markup"]
+        self.assertEqual(len(kb.inline_keyboard), len(bot.payments.PLANS))
+
+    async def test_stats_shows_services(self):
+        bot.ADMIN_IDS = {UID}
+        m = message()
+        await bot.stats_cmd(m)
+        self.assertIn("заглушка", texts(m))
 
     async def test_queue_per_user(self):
         for _ in range(2):

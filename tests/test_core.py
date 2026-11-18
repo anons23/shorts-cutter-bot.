@@ -32,6 +32,14 @@ class SubtitlesTest(unittest.TestCase):
         self.assertNotIn("{\\b1}", ass)
 
 
+class StubsTest(unittest.TestCase):
+    def test_auto_without_speech_key(self):
+        from shorts import pipeline
+        with mock.patch.object(config, "GROQ_API_KEY", ""):
+            with self.assertRaises(pipeline.ServiceNotReady):
+                pipeline.make_shorts("нет_такого.mp4", "/tmp/out_stub")
+
+
 class HighlightsTest(unittest.TestCase):
     def setUp(self):
         self.duration = 600

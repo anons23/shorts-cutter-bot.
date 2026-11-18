@@ -12,6 +12,10 @@ from .timecodes import fmt
 from .transcribe import fake_transcript, fake_words, transcribe, transcribe_range
 
 
+class ServiceNotReady(RuntimeError):
+    """Нужный внешний сервис (ИИ и т.п.) ещё не настроен."""
+
+
 def _safe_name(text: str) -> str:
     return re.sub(r"[^\w\- ]+", "", text).strip().replace(" ", "_")[:40] or "clip"
 
@@ -22,6 +26,9 @@ def make_shorts(video: str, out_dir: str, n_clips: int = config.DEFAULT_CLIPS,
                 subtitles: bool = True,
                 progress: Callable[[str], None] = lambda msg: None) -> list[dict]:
     """Автоматический режим. Возвращает список: [{"path", "title", "start", "end"}]."""
+    if not (transcript_path or fake or config.speech_ready()):
+        raise ServiceNotReady("распознавание речи ещё не подключено (нет GROQ_API_KEY)")
+    use_llm = use_llm and config.llm_ready()  # без нейросети — простой выбор моментов
     os.makedirs(out_dir, exist_ok=True)
     info = probe(video)
 
@@ -74,6 +81,8 @@ def cut_fragments(fragments: list[dict], out_dir: str, subtitles: bool = True, f
     Распознавание речи идёт только по этим отрезкам — это в разы дешевле авто-режима.
     """
     os.makedirs(out_dir, exist_ok=True)
+    if subtitles and not fake and not config.speech_ready():
+        subtitles = False  # заглушка: без ключа распознавания режем без субтитров
     results, subs_failed = [], False
     infos: dict[str, dict] = {}
     with tempfile.TemporaryDirectory(prefix="shorts_") as work:

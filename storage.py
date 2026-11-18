@@ -20,6 +20,12 @@ CREATE TABLE IF NOT EXISTS users (
     premium_until TEXT,               -- ISO-время окончания премиума
     settings      TEXT DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS events (
+    day   TEXT,
+    name  TEXT,                       -- например buy_click: нажали «Купить»
+    count INTEGER DEFAULT 0,
+    PRIMARY KEY (day, name)
+);
 CREATE TABLE IF NOT EXISTS usage (
     user_id   INTEGER,
     day       TEXT,
@@ -126,6 +132,17 @@ def referral_stats(uid: int) -> dict:
     return {"invited": row["invited"], "active": row["active"]}
 
 
+def log_event(name: str) -> None:
+    _db.execute("INSERT OR IGNORE INTO events (day, name) VALUES (?, ?)", (_today(), name))
+    _db.execute("UPDATE events SET count = count + 1 WHERE day = ? AND name = ?", (_today(), name))
+    _db.commit()
+
+
+def event_count(name: str, today_only: bool = False) -> int:
+    sql = "SELECT COALESCE(SUM(count), 0) FROM events WHERE name = ?" + (" AND day = ?" if today_only else "")
+    return _db.execute(sql, (name, _today()) if today_only else (name,)).fetchone()[0]
+
+
 def stats() -> dict:
     users = _db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
     premium = _db.execute("SELECT COUNT(*) FROM users WHERE premium_until > ?",
@@ -133,4 +150,5 @@ def stats() -> dict:
     today = _db.execute("""SELECT COUNT(*), COALESCE(SUM(fragments), 0), COALESCE(SUM(auto), 0)
                            FROM usage WHERE day = ?""", (_today(),)).fetchone()
     return {"users": users, "premium": premium, "active_today": today[0],
-            "fragments_today": today[1], "auto_today": today[2]}
+            "fragments_today": today[1], "auto_today": today[2],
+            "buy_clicks_today": event_count("buy_click", True), "buy_clicks": event_count("buy_click")}

@@ -29,9 +29,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+import payments  # noqa: E402
 import storage  # noqa: E402 — путь к базе берётся из .env
 from shorts import config  # noqa: E402
-from shorts.pipeline import cut_fragments, make_shorts  # noqa: E402
+from shorts.pipeline import ServiceNotReady, cut_fragments, make_shorts  # noqa: E402
 from shorts.render import probe  # noqa: E402
 from shorts.timecodes import (MAX_FRAGMENT_SEC, MAX_FRAGMENTS, check_range,  # noqa: E402
                               fit_to_duration, fmt, has_timecodes, parse_ranges, parse_single)
@@ -58,7 +59,6 @@ FREE_FRAGMENTS_PER_DAY = _env_int("FREE_FRAGMENTS_PER_DAY", 5)      # беспл
 PREMIUM_FRAGMENTS_PER_DAY = _env_int("PREMIUM_FRAGMENTS_PER_DAY", 0)  # премиум: 0 — без лимита
 PREMIUM_AUTO_PER_DAY = _env_int("PREMIUM_AUTO_PER_DAY", 5)          # премиум: авто-нарезок в день
 REF_PREMIUM_DAYS = _env_int("REF_PREMIUM_DAYS", 3)  # дней премиума за приглашённого активного друга
-PREMIUM_BUY_TEXT = os.getenv("PREMIUM_BUY_TEXT", "💳 Оплата подписки появится совсем скоро.")
 MAX_VIDEO_MIN = _env_int("MAX_VIDEO_MIN", 90)
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").replace(" ", "").split(",") if x}
 
@@ -116,9 +116,15 @@ async def premium_pitch(m: Message, uid: int) -> None:
         f"🎁 <b>Бесплатно:</b> пригласи друга — когда он сделает первую нарезку, "
         f"ты получишь {REF_PREMIUM_DAYS} дн. Премиума. Друзей можно звать сколько угодно.\n"
         f"Твоя ссылка: {link}\n\n"
-        f"{PREMIUM_BUY_TEXT}\n\n"
         f"А пока — ✂️ «Свои тайминги» бесплатно: {FREE_FRAGMENTS_PER_DAY} фрагментов каждый день.",
-        parse_mode="HTML", disable_web_page_preview=True)
+        parse_mode="HTML", disable_web_page_preview=True, reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="💳 Купить Премиум", callback_data="buy:menu")]]))
+
+
+def plans_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=payments.plan_title(days, price), callback_data=f"buy:{days}")]
+        for days, price in payments.PLANS])
 
 
 async def limit_reached(m: Message, uid: int) -> None:
@@ -200,6 +206,30 @@ async def premium_cmd(m: Message) -> None:
         await premium_pitch(m, m.from_user.id)
 
 
+@dp.message(Command("buy"))
+async def buy_cmd(m: Message) -> None:
+    await m.answer("👑 Выбери тариф Премиума:", reply_markup=plans_keyboard())
+
+
+@dp.callback_query(F.data.startswith("buy:"))
+async def buy_cb(c: CallbackQuery) -> None:
+    await c.answer()
+    if c.data == "buy:menu":
+        await c.message.answer("👑 Выбери тариф Премиума:", reply_markup=plans_keyboard())
+        return
+    plan = next(((d, p) for d, p in payments.PLANS if str(d) == c.data[4:]), None)
+    if not plan:
+        return
+    storage.log_event("buy_click")  # считаем интерес, даже пока оплата не подключена
+    if payments.ready():
+        await payments.start_payment(c.bot, c.message.chat.id, c.from_user.id, *plan)
+        return
+    # ЗАГЛУШКА: оплата ещё не подключена
+    await c.message.answer(
+        "💳 Оплата подключается и появится совсем скоро!\n\n"
+        f"А пока Премиум можно получить бесплатно — {REF_PREMIUM_DAYS} дн. за каждого друга: /ref")
+
+
 @dp.message(Command("ref"))
 async def ref_cmd(m: Message) -> None:
     uid = m.from_user.id
@@ -239,7 +269,22 @@ async def stats_cmd(m: Message) -> None:
     await m.answer(f"👥 Пользователей: {s['users']}\n👑 С премиумом: {s['premium']}\n"
                    f"📅 Активны сегодня: {s['active_today']}\n"
                    f"✂️ Фрагментов сегодня: {s['fragments_today']}\n🤖 Авто сегодня: {s['auto_today']}\n"
-                   f"⏳ В очереди: {queue.qsize()}")
+                   f"⏳ В очереди: {queue.qsize()}\n"
+                   f"💳 Нажали «Купить»: сегодня {s['buy_clicks_today']}, всего {s['buy_clicks']}\n\n"
+                   + services_text())
+
+
+def services_text() -> str:
+    """Что из внешних сервисов подключено, а где стоит заглушка."""
+    def row(ok: bool, name: str, stub: str) -> str:
+        return f"{'✅' if ok else '⏸'} {name}" + ("" if ok else f" — заглушка: {stub}")
+    return "🔌 Сервисы:\n" + "\n".join([
+        row(config.speech_ready(), "Распознавание речи (Groq)", "без субтитров, авто выключено"),
+        row(config.llm_ready(), "ИИ выбор моментов", "простой выбор по плотности речи"),
+        row(payments.ready(), "Оплата", "кнопка «Купить» только считает интерес"),
+        row(bool(WEBAPP_URL), "Окно разметки", "тайминги вводятся в чате"),
+        row(bool(BOT_API_URL), "Local Bot API", "файлы до 20 МБ"),
+    ])
 
 
 @dp.message(Command("settings"))
@@ -337,6 +382,10 @@ async def mode_cb(c: CallbackQuery) -> None:
     if c.data == "mode:auto":
         if not has_premium(uid):
             await premium_pitch(c.message, uid)
+            return
+        if not config.speech_ready():  # ЗАГЛУШКА: ИИ ещё не подключён
+            await c.message.answer("🤖 Авто-нарезка скоро заработает — подключаем ИИ.\n"
+                                   "А пока нарежь по своим таймингам ✂️")
             return
         if auto_left(uid) <= 0:
             await c.message.answer("🤖 Авто-нарезки на сегодня закончились. "
@@ -695,10 +744,14 @@ async def process(m: Message, kind: str, payload: str, ranges: list[tuple[float,
                                  duration=round(r["end"] - r["start"]))
         done = True
         tail = ""
+        if s["subs"] and not config.speech_ready():  # ЗАГЛУШКА
+            tail += "\n💬 Субтитры появятся, когда подключим распознавание речи."
         if not has_premium(uid):
             tail = f"\n✂️ Бесплатных фрагментов на сегодня: {fragments_left(uid)}"
         await _safe_edit(status, "✅ Готово! Присылай следующее видео." + tail)
         await reward_referrer(m.bot, uid)
+    except ServiceNotReady:
+        await _safe_edit(status, "🤖 Эта функция скоро заработает — подключаем ИИ. Лимит вернул.")
     except Exception as e:  # noqa: BLE001
         logging.exception("Ошибка обработки")
         await _safe_edit(status, f"❌ Не получилось: {str(e)[:300]}\nЛимит за это видео вернул.")
@@ -761,6 +814,7 @@ async def main() -> None:
         BotCommand(command="limit", description="Остаток на сегодня"),
         BotCommand(command="ref", description="Пригласить друга и получить Премиум"),
         BotCommand(command="premium", description="Премиум и авто-нарезка"),
+        BotCommand(command="buy", description="Купить Премиум"),
         BotCommand(command="settings", description="Настройки нарезки"),
         BotCommand(command="cancel", description="Отменить разметку"),
     ])

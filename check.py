@@ -90,6 +90,8 @@ def main() -> None:
         except requests.RequestException as e:
             report(False, f"Связь с ботом через {where}",
                    f"Нет соединения ({type(e).__name__}). Проверь VPN и BOT_API_URL")
+    if not os.getenv("PAYMENT_PROVIDER"):
+        report(False, "Оплата не подключена — кнопка «Купить» работает как заглушка", warn=True)
     webapp = os.getenv("WEBAPP_URL", "")
     if not webapp:
         report(False, "WEBAPP_URL не задан — окна разметки не будет, только ввод в чате", warn=True)
