@@ -55,6 +55,10 @@ BOT_API_URL = os.getenv("BOT_API_URL", "")  # свой Local Bot API Server (д�
 # Если Bot API сервер в Docker: папка файлов внутри контейнера и та же папка на компьютере
 BOT_API_SERVER_DIR = os.getenv("BOT_API_SERVER_DIR", "")
 BOT_API_LOCAL_DIR = os.getenv("BOT_API_LOCAL_DIR", "")
+# Папка файлов Bot API сервера (его --dir), если он запущен без Docker, например /var/lib/telegram-bot-api.
+# Сервер хранит каждый полученный файл вечно — бот удаляет свою копию сразу и чистит старые файлы.
+BOT_API_DIR = os.getenv("BOT_API_DIR", "") or BOT_API_LOCAL_DIR
+BOT_API_FILE_TTL_MIN = max(10, _env_int("BOT_API_FILE_TTL_MIN", 60))
 # Адрес окна разметки таймингов (docs/timecodes.html на GitHub Pages). Пусто — только ввод в чате
 WEBAPP_URL = os.getenv("WEBAPP_URL", "")
 
@@ -671,9 +675,57 @@ async def cached_file(bot: Bot, file_id: str) -> str:
         return path
     os.makedirs(CACHE_DIR, exist_ok=True)
     path = os.path.join(CACHE_DIR, f"{abs(hash(file_id))}_{int(time.time())}.mp4")
-    await bot.download(file_id, destination=path)
+    await download_tg(bot, file_id, path)
     local_files[file_id] = (path, time.time())
     return path
+
+
+def _bot_api_local_path(file_path: str) -> str:
+    """Путь файла от Bot API сервера -> путь на этом компьютере (для сервера в Docker)."""
+    if BOT_API_SERVER_DIR and BOT_API_LOCAL_DIR:
+        return str(SimpleFilesPathWrapper(Path(BOT_API_SERVER_DIR), Path(BOT_API_LOCAL_DIR)).to_local(file_path))
+    return file_path
+
+
+def remove_bot_api_file(root: str, file_path: str | None) -> None:
+    """Удаляет копию файла у Local Bot API сервера — только внутри его папки."""
+    if not root or not file_path:
+        return
+    try:
+        p = Path(_bot_api_local_path(file_path)).resolve()
+        p.relative_to(Path(root).resolve())
+        if p.is_file():
+            p.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+def cleanup_bot_api_dir(root: str, ttl_minutes: int) -> int:
+    """Удаляет старые файлы из папки Bot API сервера: <папка>/<токен бота>/<тип>/..."""
+    base = Path(root) if root else None
+    if base is None or not base.is_dir():
+        return 0
+    cutoff = time.time() - ttl_minutes * 60
+    removed = 0
+    for token_dir in base.iterdir():
+        if not token_dir.is_dir() or ":" not in token_dir.name:
+            continue
+        for fp in token_dir.rglob("*"):
+            try:
+                if fp.is_file() and not fp.is_symlink() and fp.stat().st_mtime < cutoff:
+                    fp.unlink()
+                    removed += 1
+            except OSError:
+                continue
+    return removed
+
+
+async def download_tg(bot: Bot, file_id: str, destination: str) -> None:
+    """Скачивает файл из Telegram и сразу удаляет копию, которую оставил у себя Local Bot API сервер."""
+    f = await bot.get_file(file_id)
+    await bot.download_file(f.file_path, destination=destination, timeout=900)
+    if BOT_API_URL:
+        remove_bot_api_file(BOT_API_DIR, f.file_path)
 
 
 def length_keyboard() -> InlineKeyboardMarkup:
@@ -950,7 +1002,7 @@ async def process(m: Message, kind: str, payload: str, ranges: list[tuple[float,
                 if cached and os.path.exists(cached):
                     shutil.move(cached, src)  # уже скачано для раскадровки
                 else:
-                    await m.bot.download(payload, destination=src)
+                    await download_tg(m.bot, payload, src)
             else:
                 src = await asyncio.to_thread(download_youtube, payload, work)
             info = await asyncio.to_thread(probe, src)
@@ -1088,6 +1140,10 @@ async def background(bot: Bot) -> None:
             if local_now().hour >= REMIND_HOUR:
                 await send_reminders(bot)
             clean_cache()
+            if BOT_API_URL and BOT_API_DIR:
+                removed = await asyncio.to_thread(cleanup_bot_api_dir, BOT_API_DIR, BOT_API_FILE_TTL_MIN)
+                if removed:
+                    logging.info("Удалено старых файлов Bot API сервера: %s", removed)
         except Exception:  # noqa: BLE001
             logging.exception("Сбой фоновой задачи")
         await asyncio.sleep(600)

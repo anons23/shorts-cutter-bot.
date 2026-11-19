@@ -23,7 +23,8 @@ def tg_bot():
     b = MagicMock()
     b.me = AsyncMock(return_value=SimpleNamespace(username="test_bot"))
     b.send_message = AsyncMock()
-    b.download = AsyncMock()
+    b.get_file = AsyncMock(return_value=SimpleNamespace(file_path="documents/file_1.mp4"))
+    b.download_file = AsyncMock()
     return b
 
 
@@ -168,7 +169,7 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
         await bot.on_link(message(text="https://youtu.be/x 0:10-0:20, 0:30-0:40"))
         m, kind, payload, ranges, charge = self.queued()[0]
         self.assertEqual(storage.used_today(UID)["fragments"], 2)
-        m.bot.download = AsyncMock(side_effect=RuntimeError("сеть"))
+        m.bot.download_file = AsyncMock(side_effect=RuntimeError("сеть"))
         await bot.process(m, "file", "file_id", ranges, charge)
         self.assertEqual(storage.used_today(UID)["fragments"], 0)
 
@@ -266,7 +267,7 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
             await bot.process(m, "file", "file1", [(10, 20)], {"fragments": 1})
         finally:
             bot.probe, bot.cut_fragments = orig
-        m.bot.download.assert_not_called()  # второй раз не скачивали
+        m.bot.download_file.assert_not_called()  # второй раз не скачивали
         self.assertEqual(captured["watermark"], "@test_bot")
         self.assertTrue(captured["hook"])
         status = m.answer.return_value
@@ -333,6 +334,44 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.queued()), 2)
         self.assertIn("Дождись", texts(m))
 
+
+    @unittest.skipIf(os.name == "nt", "в Windows в имени папки нельзя двоеточие, как у Bot API сервера")
+    async def test_bot_api_file_removed_after_download(self):
+        with tempfile.TemporaryDirectory() as root:
+            token_dir = os.path.join(root, "123:ABC", "videos")
+            os.makedirs(token_dir)
+            server_file = os.path.join(token_dir, "file_1.mp4")
+            open(server_file, "w").close()
+            outside = os.path.join(tempfile.gettempdir(), "not_bot_api_file.txt")
+            open(outside, "w").close()
+            b = tg_bot()
+            b.get_file = AsyncMock(return_value=SimpleNamespace(file_path=server_file))
+            orig = (bot.BOT_API_URL, bot.BOT_API_DIR)
+            bot.BOT_API_URL, bot.BOT_API_DIR = "http://127.0.0.1:8081", root
+            try:
+                await bot.download_tg(b, "id", os.path.join(root, "copy.mp4"))
+                bot.remove_bot_api_file(root, outside)  # чужой файл вне папки сервера не трогаем
+            finally:
+                bot.BOT_API_URL, bot.BOT_API_DIR = orig
+            self.assertFalse(os.path.exists(server_file))
+            self.assertTrue(os.path.exists(outside))
+            os.remove(outside)
+
+    @unittest.skipIf(os.name == "nt", "в Windows в имени папки нельзя двоеточие, как у Bot API сервера")
+    def test_bot_api_cleanup_only_old_files(self):
+        with tempfile.TemporaryDirectory() as root:
+            token_dir = os.path.join(root, "123:ABC", "videos")
+            os.makedirs(token_dir)
+            old, fresh = os.path.join(token_dir, "old.mp4"), os.path.join(token_dir, "fresh.mp4")
+            other = os.path.join(root, "other.txt")  # не в папке токена — не трогаем
+            for path in (old, fresh, other):
+                open(path, "w").close()
+            past = os.path.getmtime(old) - 2 * 3600
+            os.utime(old, (past, past))
+            os.utime(other, (past, past))
+            self.assertEqual(bot.cleanup_bot_api_dir(root, 60), 1)
+            self.assertFalse(os.path.exists(old))
+            self.assertTrue(os.path.exists(fresh) and os.path.exists(other))
 
 if __name__ == "__main__":
     unittest.main()
