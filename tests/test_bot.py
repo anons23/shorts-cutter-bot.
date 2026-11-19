@@ -60,6 +60,7 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         bot.drafts.clear()
         bot.pending.clear()
+        bot.jobs.clear()
         bot.queue = asyncio.Queue()
         bot.ADMIN_IDS = set()
         bot.FREE_FRAGMENTS_PER_DAY = 5
@@ -75,7 +76,7 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
     def queued(self):
         items = []
         while not bot.queue.empty():
-            items.append(bot.queue.get_nowait())
+            items.append(bot.queue.get_nowait()[:5])  # шестой элемент — задача (Job)
         return items
 
     async def test_link_with_timecodes_goes_straight_to_queue(self):
@@ -372,6 +373,68 @@ class BotFlowTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bot.cleanup_bot_api_dir(root, 60), 1)
             self.assertFalse(os.path.exists(old))
             self.assertTrue(os.path.exists(fresh) and os.path.exists(other))
+
+    def test_progress_bar(self):
+        self.assertEqual(bot.progress_bar(0.5, width=4), "▓▓░░ 50%")
+        self.assertEqual(bot.progress_bar(2), "▓" * 12 + " 100%")
+        seen = []
+        bot.ydl_hook(seen.append)({"status": "downloading", "fragment_index": 3, "fragment_count": 4})
+        bot.ydl_hook(seen.append)({"status": "downloading", "downloaded_bytes": 25, "total_bytes": 100})
+        self.assertEqual(seen, [0.75, 0.25])
+
+    async def test_progress_message_and_cancel_inside(self):
+        job = bot.Job(UID)
+        status = MagicMock()
+        status.edit_text = AsyncMock()
+        p = bot.Progress(status, asyncio.get_running_loop(), job)
+        p.step("✂️ Монтирую фрагмент 2 из 4...")
+        await asyncio.sleep(0.05)  # правка сообщения уходит в цикл событий
+        text = status.edit_text.call_args.args[0]
+        self.assertIn("▓▓▓░░░░░░░░░ 25%", text)
+        self.assertEqual(status.edit_text.call_args.kwargs["reply_markup"].inline_keyboard[0][0].callback_data,
+                         "job:cancel")
+        job.cancel.set()
+        with self.assertRaises(bot.Cancelled):
+            p.step("✂️ Монтирую фрагмент 3 из 4...")
+
+    async def test_cancel_queued_jobs(self):
+        await bot.on_link(message(text="https://youtu.be/x 0:10-0:20, 0:30-0:40"))
+        self.assertEqual(storage.used_today(UID)["fragments"], 2)
+        c = callback("job:cancel")
+        await bot.job_cancel_cb(c)
+        self.assertEqual(storage.used_today(UID)["fragments"], 0)  # лимит вернули
+        self.assertEqual(bot.pending.get(UID), 0)
+        self.assertEqual(bot.jobs[UID], [])
+        self.assertIn("отменил", texts(c.message))
+        # воркер пропускает отменённую задачу, не трогая лимит
+        item = bot.queue.get_nowait()
+        self.assertTrue(item[5].dropped)
+        # можно сразу ставить новые задачи
+        await bot.on_link(message(text="https://youtu.be/x 0:10-0:20"))
+        self.assertEqual(storage.used_today(UID)["fragments"], 1)
+
+    async def test_cancel_running_job(self):
+        job = bot.Job(UID, {"fragments": 1})
+        job.started = True
+        bot.jobs[UID] = [job]
+        storage.add_usage(UID, fragments=1)
+        m = message()
+
+        def fake_cut(fragments, out, progress, **kw):
+            job.cancel.set()  # человек нажал «Отменить» во время монтажа
+            progress("✂️ Монтирую фрагмент 1 из 1...")
+            raise AssertionError("должны были остановиться")
+        orig = (bot.probe, bot.cut_fragments)
+        bot.probe = lambda path: {"duration": 100, "has_audio": True}
+        bot.cut_fragments = fake_cut
+        try:
+            await bot.process(m, "file", "file1", [(10, 20)], {"fragments": 1}, job)
+        finally:
+            bot.probe, bot.cut_fragments = orig
+        status = m.answer.return_value
+        self.assertIn("Отменено", status.edit_text.call_args.args[0])
+        self.assertEqual(storage.used_today(UID)["fragments"], 0)
+        m.answer_video.assert_not_called()
 
 if __name__ == "__main__":
     unittest.main()

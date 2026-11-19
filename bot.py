@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 from urllib.parse import quote, urlencode
@@ -508,8 +509,20 @@ async def noop_cb(c: CallbackQuery) -> None:
 
 @dp.message(Command("cancel"))
 async def cancel_cmd(m: Message) -> None:
-    drafts.pop(m.from_user.id, None)
-    await m.answer("Отменил. Присылай новое видео 🎬", reply_markup=ReplyKeyboardRemove())
+    n = await cancel_all(m.from_user.id)
+    await m.answer(("🛑 Отменил всё, лимит вернул.\n" if n else "Отменять нечего. ") + "Присылай новое видео 🎬",
+                   reply_markup=ReplyKeyboardRemove())
+
+
+@dp.callback_query(F.data == "job:cancel")
+async def job_cancel_cb(c: CallbackQuery) -> None:
+    n = await cancel_all(c.from_user.id)
+    await c.answer("🛑 Отменяю всё" if n else "Нечего отменять — всё уже закончилось")
+    if n:
+        await c.message.answer("🛑 Всё отменил, лимит вернул. Присылай новое видео 🎬",
+                               reply_markup=ReplyKeyboardRemove())
+    else:
+        await _hide_buttons(c.message)
 
 
 # ------------------------------------------------------- приём видео -------
@@ -902,41 +915,144 @@ def _plural(n: int) -> str:
 
 # ------------------------------------------------------------- очередь ------
 
+class Cancelled(Exception):
+    """Человек нажал «Отменить»."""
+
+
+class Job:
+    """Одна задача нарезки: её можно отменить и в очереди, и во время работы."""
+
+    def __init__(self, uid: int, charge: dict | None = None):
+        self.uid = uid
+        self.charge = charge or {}
+        self.cancel = threading.Event()
+        self.started = False   # воркер уже взял её в работу
+        self.dropped = False   # отменена, пока ждала в очереди — воркер её просто пропустит
+        self.status: Message | None = None
+
+
+jobs: dict[int, list[Job]] = {}  # {user_id: задачи в очереди и в работе}
+
+
+def cancel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Отменить", callback_data="job:cancel")]])
+
+
+def progress_bar(frac: float, width: int = 12) -> str:
+    frac = max(0.0, min(1.0, frac))
+    filled = round(frac * width)
+    return "▓" * filled + "░" * (width - filled) + f" {round(frac * 100)}%"
+
+
+class Progress:
+    """Сообщение со статусом и полосой прогресса. Telegram не любит частые правки,
+    поэтому внутри одного этапа обновляем не чаще раза в PROGRESS_EVERY секунд."""
+    PROGRESS_EVERY = 3.0
+
+    def __init__(self, msg: Message, loop: asyncio.AbstractEventLoop, job: Job):
+        self.msg, self.loop, self.job = msg, loop, job
+        self.text, self.shown, self.last = "", "", 0.0
+
+    def set(self, text: str, frac: float | None = None) -> None:
+        """Можно звать из рабочего потока. Если задачу отменили — прерывает её."""
+        if self.job.cancel.is_set():
+            raise Cancelled()
+        now = time.monotonic()
+        if text == self.text and now - self.last < self.PROGRESS_EVERY:
+            return
+        self.text, self.last = text, now
+        body = text + (f"\n{progress_bar(frac)}" if frac is not None else "")
+        if body == self.shown:
+            return
+        self.shown = body
+        asyncio.run_coroutine_threadsafe(_safe_edit(self.msg, body, cancel_keyboard()), self.loop)
+
+    def step(self, text: str) -> None:
+        """Сообщения ядра вида «Монтирую фрагмент 2 из 3» — полоса по номеру шага."""
+        found = re.search(r"(\d+) из (\d+)", text)
+        frac = (int(found.group(1)) - 1) / int(found.group(2)) if found else None
+        self.set(text, frac)
+
+
+def ydl_hook(report) -> callable:
+    """Хук yt-dlp: доля скачанного (по кускам или по байтам) -> report(доля)."""
+    def hook(d: dict) -> None:
+        if d.get("status") != "downloading":
+            return
+        frac = None
+        if d.get("fragment_count"):
+            frac = (d.get("fragment_index") or 0) / d["fragment_count"]
+        elif d.get("total_bytes") or d.get("total_bytes_estimate"):
+            frac = (d.get("downloaded_bytes") or 0) / (d.get("total_bytes") or d["total_bytes_estimate"])
+        report(frac)
+    return hook
+
+
+async def cancel_all(uid: int) -> int:
+    """Кнопка «Отменить»: сбрасывает разметку, убирает задачи из очереди и останавливает текущую."""
+    had_draft = drafts.pop(uid, None) is not None
+    user_jobs = jobs.get(uid, [])
+    count = len(user_jobs) + had_draft
+    for job in list(user_jobs):
+        job.cancel.set()
+        if job.started:
+            if job.status:  # саму остановку и возврат лимита сделает process()
+                await _safe_edit(job.status, "🛑 Останавливаю...")
+            continue
+        job.dropped = True
+        storage.add_usage(uid, **{k: -v for k, v in job.charge.items()})
+        pending[uid] = max(0, pending.get(uid, 0) - 1)
+        user_jobs.remove(job)
+        if job.status:
+            await _safe_edit(job.status, "🛑 Отменено, лимит вернул.")
+    return count
+
+
 async def enqueue(m: Message, kind: str, payload: str,
                   ranges: list[tuple[float, float]] | None) -> None:
     uid = m.from_user.id
     if pending.get(uid, 0) >= MAX_QUEUE_PER_USER and not is_admin(uid):
-        await m.answer("⏳ Дождись, пока обработаются предыдущие видео.")
+        await m.answer("⏳ Дождись, пока обработаются предыдущие видео — или нажми «❌ Отменить».",
+                       reply_markup=cancel_keyboard())
         return
     storage.touch(uid)
     # списываем лимит сразу, чтобы его нельзя было обойти очередью; при ошибке вернём
     charge = {"fragments": len(ranges)} if ranges else {"auto": 1}
     storage.add_usage(uid, **charge)
     pending[uid] = pending.get(uid, 0) + 1
-    await queue.put((m, kind, payload, ranges, charge))
-    pos = queue.qsize()
-    await m.answer("✅ Принял! " + (f"Ты в очереди: {pos}-й." if pos > 1 else "Начинаю обработку..."))
+    job = Job(uid, charge)
+    jobs.setdefault(uid, []).append(job)
+    pos = queue.qsize() + 1
+    # сначала сообщение, потом очередь: иначе воркер может взять задачу раньше, чем оно появится
+    job.status = await m.answer("✅ Принял! " + (f"Ты в очереди: {pos}-й." if pos > 1 else "Начинаю обработку..."),
+                                reply_markup=cancel_keyboard())
+    await queue.put((m, kind, payload, ranges, charge, job))
 
 
 YT_FORMAT = "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/b"
 
 
-def download_youtube_sections(url: str, ranges: list[tuple[float, float]],
-                              work: str) -> tuple[list[dict], list[str]]:
+def download_youtube_sections(url: str, ranges: list[tuple[float, float]], work: str,
+                              report=lambda text, frac: None) -> tuple[list[dict], list[str]]:
     """Скачивает с YouTube только нужные куски, а не всё видео — быстрее и почти не занимает диск."""
     import yt_dlp
-    with yt_dlp.YoutubeDL({"quiet": True, "noplaylist": True}) as ydl:
+    with yt_dlp.YoutubeDL({"quiet": True, "noprogress": True, "noplaylist": True}) as ydl:
         info = ydl.extract_info(url, download=False)
     ranges, errors = fit_to_duration(ranges, float(info.get("duration") or 0) or float("inf"))
     fragments = []
+    n = len(ranges)
     for i, (start, end) in enumerate(ranges, 1):
+        text = f"⏬ Скачиваю кусок {i} из {n}"
+        report(text, (i - 1) / n)
         opts = {
             "format": YT_FORMAT,
             "outtmpl": os.path.join(work, f"part_{i:02d}.%(ext)s"),
             "merge_output_format": "mp4",
-            "quiet": True, "noplaylist": True,
+            "quiet": True, "noprogress": True, "noplaylist": True,
             "download_ranges": yt_dlp.utils.download_range_func(None, [(start, end)]),
             "force_keyframes_at_cuts": True,  # точный рез, а не по ближайшему ключевому кадру
+            "progress_hooks": [ydl_hook(lambda f, i=i, text=text: report(text, (i - 1 + (f or 0)) / n))],
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.download([url])
@@ -948,14 +1064,15 @@ def download_youtube_sections(url: str, ranges: list[tuple[float, float]],
     return fragments, errors
 
 
-def download_youtube(url: str, work: str) -> str:
+def download_youtube(url: str, work: str, report=lambda text, frac: None) -> str:
     import yt_dlp
     opts = {
         "format": YT_FORMAT,
         "outtmpl": os.path.join(work, "source.%(ext)s"),
         "merge_output_format": "mp4",
-        "quiet": True, "noplaylist": True,
+        "quiet": True, "noprogress": True, "noplaylist": True,
         "match_filter": yt_dlp.utils.match_filter_func(f"duration <= {MAX_VIDEO_MIN * 60}"),
+        "progress_hooks": [ydl_hook(lambda f: report("⏬ Скачиваю видео", f))],
     }
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -970,14 +1087,16 @@ def download_youtube(url: str, work: str) -> str:
 
 
 async def process(m: Message, kind: str, payload: str, ranges: list[tuple[float, float]] | None,
-                  charge: dict) -> None:
+                  charge: dict, job: Job | None = None) -> None:
     uid = m.from_user.id
     loop = asyncio.get_running_loop()
-    status = await m.answer("⏬ Скачиваю видео..." if not (ranges and kind == "youtube")
-                            else f"⏬ Скачиваю только нужные куски ({len(ranges)})...")
-
-    def progress(text: str) -> None:  # вызывается из рабочего потока
-        asyncio.run_coroutine_threadsafe(_safe_edit(status, text), loop)
+    job = job or Job(uid, charge)
+    first = ("⏬ Скачиваю видео..." if not (ranges and kind == "youtube")
+             else f"⏬ Скачиваю только нужные куски ({len(ranges)})...")
+    status = job.status or await m.answer(first, reply_markup=cancel_keyboard())
+    bar = Progress(status, loop, job)
+    bar.set(first)
+    progress = bar.step  # сообщения ядра: «Монтирую фрагмент 2 из 3» и т.п.
 
     work = tempfile.mkdtemp(prefix="job_")
     s = settings_for(uid)
@@ -990,10 +1109,13 @@ async def process(m: Message, kind: str, payload: str, ranges: list[tuple[float,
         fragments, errors = None, []
         if ranges and kind == "youtube":
             try:
-                fragments, errors = await asyncio.to_thread(download_youtube_sections, payload, ranges, work)
+                fragments, errors = await asyncio.to_thread(download_youtube_sections, payload, ranges,
+                                                            work, bar.set)
             except Exception:  # noqa: BLE001 — не вышло кусками, качаем целиком
+                if job.cancel.is_set():
+                    raise Cancelled()
                 logging.exception("Не удалось скачать куски, качаю видео целиком")
-                await _safe_edit(status, "⏬ Скачиваю видео целиком...")
+                bar.set("⏬ Скачиваю видео целиком...")
 
         if fragments is None:
             if kind == "file":
@@ -1004,7 +1126,8 @@ async def process(m: Message, kind: str, payload: str, ranges: list[tuple[float,
                 else:
                     await download_tg(m.bot, payload, src)
             else:
-                src = await asyncio.to_thread(download_youtube, payload, work)
+                src = await asyncio.to_thread(download_youtube, payload, work, bar.set)
+            bar.set("🔍 Проверяю видео...")
             info = await asyncio.to_thread(probe, src)
             if ranges:
                 ok, errors = fit_to_duration(ranges, info["duration"])
@@ -1028,8 +1151,8 @@ async def process(m: Message, kind: str, payload: str, ranges: list[tuple[float,
         else:
             results = await asyncio.to_thread(make_shorts, src, out, n_clips=s["clips"], **style)
 
-        await _safe_edit(status, f"📤 Отправляю {len(results)} шортс(ов)...")
-        for r in results:
+        for i, r in enumerate(results, 1):
+            bar.step(f"📤 Отправляю шортс {i} из {len(results)}...")
             icon = "✂️" if fragments is not None else "🎬"
             caption = f"{icon} {r['title']}\n⏱ {fmt(r['start'])}–{fmt(r['end'])}"
             await m.answer_video(FSInputFile(r["path"]), caption=caption, supports_streaming=True,
@@ -1046,11 +1169,16 @@ async def process(m: Message, kind: str, payload: str, ranges: list[tuple[float,
                          InlineKeyboardMarkup(inline_keyboard=[[
                              InlineKeyboardButton(text="📤 Поделиться ботом с другом", url=share_url(link))]]))
         await reward_referrer(m.bot, uid)
+    except Cancelled:
+        await _safe_edit(status, "🛑 Отменено, лимит вернул.")
     except ServiceNotReady:
         await _safe_edit(status, "🤖 Эта функция скоро заработает — подключаем ИИ. Лимит вернул.")
     except Exception as e:  # noqa: BLE001
-        logging.exception("Ошибка обработки")
-        await _safe_edit(status, f"❌ Не получилось: {str(e)[:300]}\nЛимит за это видео вернул.")
+        if job.cancel.is_set():  # yt-dlp мог обернуть нашу отмену в свою ошибку
+            await _safe_edit(status, "🛑 Отменено, лимит вернул.")
+        else:
+            logging.exception("Ошибка обработки")
+            await _safe_edit(status, f"❌ Не получилось: {str(e)[:300]}\nЛимит за это видео вернул.")
     finally:
         if not done:
             storage.add_usage(uid, **{k: -v for k, v in charge.items()})
@@ -1081,14 +1209,20 @@ async def _safe_edit(msg: Message, text: str, markup: InlineKeyboardMarkup | Non
 async def worker() -> None:
     """Обрабатываем по одной задаче за раз — слабому серверу так легче."""
     while True:
-        m, kind, payload, ranges, charge = await queue.get()
+        m, kind, payload, ranges, charge, job = await queue.get()
+        uid = m.from_user.id
+        if job.dropped:  # отменили, пока ждала: лимит и очередь cancel_all уже поправил
+            queue.task_done()
+            continue
+        job.started = True
         try:
-            await process(m, kind, payload, ranges, charge)
+            await process(m, kind, payload, ranges, charge, job)
         except Exception:  # noqa: BLE001 — очередь не должна останавливаться из-за одной ошибки
             logging.exception("Сбой в обработчике очереди")
         finally:
-            uid = m.from_user.id
             pending[uid] = max(0, pending.get(uid, 0) - 1)
+            if job in jobs.get(uid, []):
+                jobs[uid].remove(job)
             queue.task_done()
 
 
@@ -1184,7 +1318,7 @@ async def main() -> None:
         BotCommand(command="premium", description="Премиум и авто-нарезка"),
         BotCommand(command="buy", description="Купить Премиум"),
         BotCommand(command="settings", description="Настройки нарезки"),
-        BotCommand(command="cancel", description="Отменить разметку"),
+        BotCommand(command="cancel", description="Отменить всё: разметку и нарезку"),
     ])
     asyncio.create_task(worker())
     asyncio.create_task(background(bot))
