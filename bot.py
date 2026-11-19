@@ -988,7 +988,7 @@ async def process(m: Message, kind: str, payload: str, ranges: list[tuple[float,
         if s["subs"] and not config.speech_ready():  # ЗАГЛУШКА
             tail += "\n💬 Субтитры появятся, когда подключим распознавание речи."
         if not has_premium(uid):
-            tail = f"\n✂️ Бесплатных фрагментов на сегодня: {fragments_left(uid)}"
+            tail += f"\n✂️ Бесплатных фрагментов на сегодня: {fragments_left(uid)}"
         link = await ref_link(m.bot, uid)
         await _safe_edit(status, "✅ Готово! Присылай следующее видео." + tail,
                          InlineKeyboardMarkup(inline_keyboard=[[
